@@ -31,8 +31,17 @@ type Runner struct {
 	z          zulipAPI
 	onFinished func(Job) // set by the integration wiring; sends the webhook
 
-	mu      sync.Mutex
-	running map[string]*exec.Cmd
+	mu       sync.Mutex
+	stopping bool
+	running  map[string]*recording
+}
+
+// recording tracks one accepted job from Start until its final state is on
+// disk — not merely until the child exits, so Stop can neither miss a job whose
+// child has not spawned yet nor return while a job.json still says "recording".
+type recording struct {
+	cmd  *exec.Cmd     // nil until the child has actually been started
+	done chan struct{} // closed once the job has been settled
 }
 
 // nodeBin is the interpreter the recorder is launched with.
@@ -66,7 +75,7 @@ const (
 )
 
 func newRunner(cfg Config, z zulipAPI, onFinished func(Job)) *Runner {
-	return &Runner{cfg: cfg, z: z, onFinished: onFinished, running: map[string]*exec.Cmd{}}
+	return &Runner{cfg: cfg, z: z, onFinished: onFinished, running: map[string]*recording{}}
 }
 
 // Start records the job as recording and spawns the recorder. It returns
@@ -89,12 +98,22 @@ func (r *Runner) Start(job Job) error {
 	if err := job.save(r.cfg.DataDir); err != nil {
 		return err
 	}
-	go r.run(job)
+	// Registered here, not in run: Stop must see a job it just accepted.
+	rec := &recording{done: make(chan struct{})}
+	r.running[job.ID] = rec
+	go r.run(job, rec)
 	return nil
 }
 
 // run drives one recorder child process to completion and settles the job.
-func (r *Runner) run(job Job) {
+func (r *Runner) run(job Job, rec *recording) {
+	defer func() {
+		r.mu.Lock()
+		delete(r.running, job.ID)
+		r.mu.Unlock()
+		close(rec.done)
+	}()
+
 	cmd := exec.Command(nodeBin, r.cfg.RecorderPath,
 		"--url", job.JitsiURL,
 		"--out", job.AudioPath,
@@ -111,15 +130,16 @@ func (r *Runner) run(job Job) {
 	if err == nil {
 		if err = cmd.Start(); err == nil {
 			r.mu.Lock()
-			r.running[job.ID] = cmd
+			rec.cmd = cmd
+			stopping := r.stopping
 			r.mu.Unlock()
-
+			if stopping {
+				// Stop ran between Start and here, so this child missed its
+				// signal round; send it now.
+				signalProcess(job.ID, cmd, syscall.SIGTERM)
+			}
 			tail = drainStderr(stderr, job.ID)
 			err = cmd.Wait()
-
-			r.mu.Lock()
-			delete(r.running, job.ID)
-			r.mu.Unlock()
 		}
 	}
 
@@ -184,42 +204,51 @@ func (r *Runner) clearReaction(ctx context.Context, job Job) {
 }
 
 // Stop asks every running recorder to finalize (SIGTERM, which makes record.js
-// exit 0 with reason "signal"), then kills whatever is left after grace.
+// exit 0 with reason "signal") and returns once every accepted job has its
+// final state on disk, or once grace has elapsed — then it kills the stragglers.
 func (r *Runner) Stop(grace time.Duration) {
 	r.mu.Lock()
-	cmds := make([]*exec.Cmd, 0, len(r.running))
-	for _, c := range r.running {
-		cmds = append(cmds, c)
+	r.stopping = true
+	recs := make([]*recording, 0, len(r.running))
+	for _, rec := range r.running {
+		recs = append(recs, rec)
 	}
 	r.mu.Unlock()
-	if len(cmds) == 0 {
+	if len(recs) == 0 {
 		return
 	}
-	slog.Info("stopping recorders", "count", len(cmds), "grace", grace)
-	signalAll(cmds, syscall.SIGTERM)
+	slog.Info("stopping recorders", "count", len(recs), "grace", grace)
+	r.signalRunning(syscall.SIGTERM)
 
-	// ponytail: 100 ms polling instead of a WaitGroup — shutdown is not hot.
-	for deadline := time.Now().Add(grace); time.Now().Before(deadline); {
-		r.mu.Lock()
-		n := len(r.running)
-		r.mu.Unlock()
-		if n == 0 {
+	deadline := time.Now().Add(grace)
+	for _, rec := range recs {
+		select {
+		case <-rec.done:
+		case <-time.After(time.Until(deadline)):
+			slog.Warn("recorders did not stop within grace, killing")
+			// ponytail: killed children are left to settle on their own —
+			// blocking shutdown past the grace period is the worse failure.
+			r.signalRunning(syscall.SIGKILL)
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
-	slog.Warn("recorders did not stop within grace, killing")
-	signalAll(cmds, syscall.SIGKILL)
 }
 
-func signalAll(cmds []*exec.Cmd, sig os.Signal) {
-	for _, c := range cmds {
-		if c.Process == nil {
-			continue
-		}
-		if err := c.Process.Signal(sig); err != nil {
-			slog.Debug("signalling recorder", "sig", sig, "err", err) // usually "already finished"
-		}
+// signalRunning sends sig to every child that has actually been started.
+func (r *Runner) signalRunning(sig os.Signal) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, rec := range r.running {
+		signalProcess(id, rec.cmd, sig)
+	}
+}
+
+func signalProcess(id string, cmd *exec.Cmd, sig os.Signal) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := cmd.Process.Signal(sig); err != nil {
+		slog.Debug("signalling recorder", "job", id, "sig", sig, "err", err) // usually "already finished"
 	}
 }
 

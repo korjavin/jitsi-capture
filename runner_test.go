@@ -28,9 +28,11 @@ type fakeZulip struct {
 	mu    sync.Mutex
 	calls []zulipCall
 	err   error
+	delay time.Duration // stands in for a slow Zulip during shutdown
 }
 
 func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string) error {
+	time.Sleep(f.delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, zulipCall{msgID: msgID, emoji: emoji, isRemoveReact: true})
@@ -284,6 +286,36 @@ func TestRunFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Stop must cover a job accepted a moment earlier and must not return until
+// that job's final state is on disk — otherwise the next Resume would mark a
+// finished recording as interrupted.
+func TestStopWaitsForSettlement(t *testing.T) {
+	r, z, _ := newTestRunner(t, "rec_ok.sh")
+	z.delay = 200 * time.Millisecond
+
+	job := testJob()
+	if err := r.Start(job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	r.Stop(15 * time.Second)
+
+	got, err := loadJob(r.cfg.DataDir, job.ID)
+	if err != nil {
+		t.Fatalf("loadJob after Stop: %v", err)
+	}
+	if got.State == JobRecording {
+		t.Error("Stop returned while the job was still marked recording")
+	}
+	if got.EndedAt == nil {
+		t.Error("Stop returned before ended_at was persisted")
+	}
+}
+
+func TestStopWithNothingRunning(t *testing.T) {
+	r, _, _ := newTestRunner(t, "rec_ok.sh")
+	r.Stop(time.Second) // must not block
 }
 
 func TestResume(t *testing.T) {
