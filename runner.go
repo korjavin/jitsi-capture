@@ -173,8 +173,8 @@ func (r *Runner) run(job Job, rec *recording) {
 	r.settle(job)
 }
 
-// settle posts the failure note if any, drops the recording reaction, persists
-// the job and hands a finished job to the webhook sender.
+// settle posts the failure note if any, persists the job, drops the recording
+// reaction and hands a finished job to the webhook sender.
 func (r *Runner) settle(job Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
 	defer cancel()
@@ -182,10 +182,14 @@ func (r *Runner) settle(job Job) {
 	if job.State == JobFailed {
 		r.note(ctx, job)
 	}
-	r.clearReaction(ctx, job)
+	// Persist before dropping the reaction: a 🎙️ click racing the removal must
+	// see the final state on disk. The other order lets Start read "recording",
+	// return ErrDuplicateJob, and leave the bot's 🔴 re-add landing after the
+	// removal — a red dot stuck on a message whose job is already over.
 	if err := job.save(r.cfg.DataDir); err != nil {
 		slog.Error("saving job", "job", job.ID, "err", err)
 	}
+	r.clearReaction(ctx, job)
 	if job.State == JobFinished && r.onFinished != nil {
 		r.onFinished(job)
 	}

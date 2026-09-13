@@ -25,13 +25,17 @@ type zulipCall struct {
 }
 
 type fakeZulip struct {
-	mu    sync.Mutex
-	calls []zulipCall
-	err   error
-	delay time.Duration // stands in for a slow Zulip during shutdown
+	mu           sync.Mutex
+	calls        []zulipCall
+	err          error
+	delay        time.Duration // stands in for a slow Zulip during shutdown
+	beforeRemove func()        // runs at the start of RemoveReaction
 }
 
 func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string) error {
+	if f.beforeRemove != nil {
+		f.beforeRemove()
+	}
 	time.Sleep(f.delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -93,8 +97,9 @@ func newTestRunner(t *testing.T, script string) (*Runner, *fakeZulip, chan Job) 
 	return newRunner(cfg, z, func(j Job) { finished <- j }), z, finished
 }
 
-// waitSettled polls job.json until the job leaves the recording state. Every
-// Zulip call and the save happen before that, so no sleeps are needed after it.
+// waitSettled polls job.json until the job leaves the recording state. The
+// failure note is posted before that; the reaction removal follows the save, so
+// assert it with waitReactionRemoved.
 func waitSettled(t *testing.T, dataDir, id string) Job {
 	t.Helper()
 	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
@@ -105,6 +110,18 @@ func waitSettled(t *testing.T, dataDir, id string) Job {
 	}
 	t.Fatalf("job %s never left the recording state", id)
 	return Job{}
+}
+
+// waitReactionRemoved polls for the recording reaction being dropped.
+func waitReactionRemoved(t *testing.T, z *fakeZulip, msgID int64) {
+	t.Helper()
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+		if z.reactionRemoved(msgID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("recording reaction on %d was not removed", msgID)
 }
 
 func TestJobSaveLoadRoundTrip(t *testing.T) {
@@ -255,6 +272,31 @@ func TestRunSuccess(t *testing.T) {
 	}
 }
 
+// The on-disk state must be final before the recording reaction goes away:
+// otherwise a 🎙️ click arriving in that window reads "recording", Start rejects
+// it as a duplicate, and the bot's 🔴 re-add outlives the removal.
+func TestSettleSavesBeforeClearingReaction(t *testing.T) {
+	r, z, finished := newTestRunner(t, "rec_ok.sh")
+	job := testJob()
+	var stateAtRemoval string
+	z.beforeRemove = func() {
+		if j, err := loadJob(r.cfg.DataDir, job.ID); err == nil {
+			stateAtRemoval = j.State
+		}
+	}
+	if err := r.Start(job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(15 * time.Second):
+		t.Fatal("onFinished was never called")
+	}
+	if stateAtRemoval != JobFinished {
+		t.Errorf("job.json said %q while the reaction was removed, want %q", stateAtRemoval, JobFinished)
+	}
+}
+
 func TestRunFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, script, wantErr string
@@ -276,9 +318,7 @@ func TestRunFailures(t *testing.T) {
 			if msgs := z.messages(); len(msgs) != 1 || msgs[0] != failNote[tc.wantErr] {
 				t.Errorf("notes = %v, want %q", msgs, failNote[tc.wantErr])
 			}
-			if !z.reactionRemoved(job.MessageID) {
-				t.Error("recording reaction was not removed")
-			}
+			waitReactionRemoved(t, z, job.MessageID)
 			select {
 			case j := <-finished:
 				t.Errorf("onFinished called for a failed job: %+v", j)
