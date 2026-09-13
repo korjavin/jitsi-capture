@@ -4,7 +4,7 @@
 .claude
 .agents
 .codex
-node_modules
+**/node_modules
 data
 .env
 **/__pycache__
