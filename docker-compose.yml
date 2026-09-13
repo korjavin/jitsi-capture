@@ -1,0 +1,49 @@
+services:
+  jitsi-capture:
+    build: .
+    image: jitsi-capture
+    # Every variable config.go reads, passed straight through: Compose takes the
+    # values from .env next to this file, or from the stack environment when
+    # Portainer deploys this repo as a git stack (there is no .env there). A
+    # variable left unset is simply not passed, so the image defaults stand.
+    # See .env.example for what each one means.
+    environment:
+      - ZULIP_SITE
+      - ZULIP_BOT_EMAIL
+      - ZULIP_BOT_API_KEY
+      - JITSI_BASE_URL
+      - DATA_DIR
+      - HOST_DATA_DIR
+      - RECORDER_PATH
+      - BOT_DISPLAY_NAME
+      - JOIN_TIMEOUT_S
+      - MAX_DURATION_S
+      - EMPTY_GRACE_S
+      - MIN_RECORDING_S
+      - AUDIO_RETENTION_DAYS
+      - WEBHOOK_URL
+      - WEBHOOK_SECRET
+      - LISTEN_ADDR
+      - PUBLIC_URL
+      - LOG_LEVEL
+    volumes:
+      # Job state (jobs/<id>/job.json) and audio survive a redeploy. Both sides
+      # follow the variables so HOST_DATA_DIR stays the host path the webhook
+      # advertises and the mount always lands on DATA_DIR.
+      - ${HOST_DATA_DIR:-./data}:${DATA_DIR:-/data}
+    ports:
+      # POST /notify (transcript callback) + GET /health. The sibling
+      # transcriber posts here over the same host/network.
+      - "8080:8080"
+    # Chromium needs more than Docker's 64 MB default /dev/shm.
+    shm_size: "1g"
+    # A SIGTERM'd recorder finalizes its file and the webhook still goes out;
+    # main.go gives the recorders 110 s, so do not lower this below ~120 s.
+    stop_grace_period: 120s
+    restart: unless-stopped
+    # RAM: one headless Chromium is roughly 400-800 MB per concurrent
+    # recording, on top of ~30 MB for the Go service.
+    #
+    # ponytail: no healthcheck — the runtime image ships neither curl nor wget,
+    # and adding one just to probe GET /health is not worth the layer. Add it
+    # the day the image needs a real HTTP client anyway.

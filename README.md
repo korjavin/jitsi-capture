@@ -1,172 +1,299 @@
-# jitsi2outline
+# jitsi-capture
 
-_This document is the original design spec. The product has since been split into three
-services (jitsi-capture → transcriber → tr2outline), and this repository is jitsi-capture
-only — see `CLAUDE.md` for the current architecture. A full rewrite of this README is
-tracked separately._
-
-A self-hosted service for private, local recording of **Jitsi Meet** calls, transcription on **CPU**, and saving the results into the **Outline** knowledge base, with **Zulip** integration.
+Records **Jitsi Meet** calls started from **Zulip**, on request, entirely on your
+own hardware. A participant clicks a 🎙️ reaction, a headless bot joins the call,
+and the audio lands on disk and is handed to the next service by a signed
+webhook. No audio ever leaves the local perimeter.
 
 ---
 
-## 🎯 Project goals and context
+## 1. What this is
 
-1. **Call context:** Jitsi video calls are started from the **Zulip** messenger (by clicking the call button, which generates a link to a `meet.jit.si/<room>` room).
-2. **On-demand joining:** The bot should join a call not permanently, but on request from the participants (via a command/notification from Zulip or a webhook).
-3. **100% on-premise / privacy:** Audio data must not leave for third-party clouds (Recall.ai, Otter, Fireflies, etc.). All processing happens strictly inside the local perimeter.
-4. **Transcription on CPU:** Audio processing runs locally on CPU (speed is not critical; the priority is quality and reliability).
-5. **Outline integration:** Transcription results are formatted as Markdown and published automatically into the **Outline** knowledge base via its REST API.
-6. **Feedback into Zulip:** A link to the finished document in Outline is sent back to the same stream/topic in Zulip.
-
----
-
-## 🏗️ System architecture
+`jitsi-capture` is the **first of three services**:
 
 ```text
-               1. @transcribe start / link
-  [ Zulip ] ───────────────────────────────────► [ Bot Controller ]
-     ▲                                                   │
-     │ 6. Link to Outline                                │ 2. Start the job
-     │                                                   ▼
-     │                                      [ Jitsi Headless Recorder ]
-     │                                      (Node.js + puppeteer-stream)
-     │                                                   │
-     │                                                   │ 3. Join Jitsi as a bot
-     │                                                   ▼
-     │                                          [ meet.jit.si / Jitsi ]
-     │                                                   │
-     │                                                   │ 4. Record audio (audio.wav)
-     │                                                   ▼
-     │                                           [ Transcriber ]
-     │                                        (faster-whisper on CPU)
-     │                                                   │
-     │               5. Create the document              ▼
-  [ Outline ] ◄────────────────────────────── [ Outline Publisher ]
+Zulip 🎙️ click
+  -> jitsi-capture        records the Jitsi call, audio under DATA_DIR
+  -> signed webhook `recording.finished`
+  -> transcriber          CPU transcription
+  -> Anarlog-format webhook
+  -> tr2outline           publishes the transcript into Outline
+  -> callback POST /notify on jitsi-capture
+  -> "transcript ready" message in the original Zulip topic
 ```
 
----
+This repository does **only** the first box: the Zulip bot (reaction flow),
+running the Node recorder as a child process, persisting job state and audio on
+disk, sending the webhook, and serving `/notify` + `/health`. **No transcription
+and no Outline here.**
 
-## 🔬 Component research findings
+Sibling repositories:
 
-### 1. Joining a Jitsi call and recording its audio
-* **Why not Jitsi Jibri:** Jibri is hard-wired to the internal XMPP control protocol of its own Jitsi server. For joining the public `meet.jit.si` as a guest it is unusable and excessively heavy.
-* **Chosen approach: headless Chromium + `puppeteer-stream` (Node.js)**
-  * It lets us capture the page's incoming audio stream directly through the Chrome DevTools / Extension API, with no need to run heavy virtual displays (Xvfb) and virtual audio servers (PulseAudio).
-  * **Automatic join without clicking through the UI:** Jitsi settings are passed straight in the URL hash:
-    ```text
-    https://meet.jit.si/<ROOM_ID>#config.prejoinConfig.enabled=false&config.startWithAudioMuted=true&config.startWithVideoMuted=true&userInfo.displayName="🎙️ Transcriber"
-    ```
-    This disables the pre-join screen (Lobby) and turns off the bot's microphone/camera, removing any dependency on changes to the Jitsi UI.
-  * **Detecting the end of the meeting:** The script tracks the participant count via DOM selectors or the Jitsi API. If the bot is the only one left in the room (or on a silence timeout / a stop command), the recording is finalized.
-
-### 2. Local transcription on CPU
-* **Engine:** [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (built on CTranslate2).
-* **CPU configuration:**
-  * `device="cpu"`
-  * `compute_type="int8"` — reduces memory usage and speeds up inference on CPU by 2–4x with no loss of quality.
-  * Model: `large-v3` for the best quality on Russian and English (or `medium` for faster runs).
-* **Formatting:** The script splits the audio into segments with timecodes:
-  ```markdown
-  [00:05] Hi everyone, let's start with the architecture discussion...
-  [00:18] On the second point, I propose the following solution...
-  ```
-
-### 3. Export to Outline
-* Outline offers a simple REST API.
-* Endpoint: `POST /api/documents.create`
-* Authorization: `Authorization: Bearer <OUTLINE_API_KEY>`
-* Payload:
-  ```json
-  {
-    "collectionId": "<COLLECTION_ID>",
-    "title": "Meeting: <Zulip topic name> (<Date>)",
-    "text": "# Meeting transcript\n\n**Date:** 2026-09-13\n**Zulip topic:** ...\n\n---\n\n## Transcript\n...",
-    "publish": true
-  }
-  ```
-* The API response returns `data.url` (or the document path), which forms the link to send to Zulip.
-
-### 4. Zulip integration and automatic bot joining
-
-#### Activation scenario: an unobtrusive semi-automatic flow via emoji reactions
-So as not to clutter chats with extra service messages and not to record accidental short calls, the following mechanics were adopted:
-
-1. **Call detection:**
-   * The Zulip bot is subscribed to the event stream (Events API).
-   * When someone starts a video call, Zulip posts a system message with a link to `meet.jit.si/...`.
-   * The bot intercepts that message and extracts the room URL and the message ID.
-2. **A quiet offer to record (without spamming the chat):**
-   * The bot **does not post any text messages into the topic**.
-   * Instead, the bot immediately **places a 🎙️ (or 🔴) emoji reaction** on the call-start message itself via the Zulip API (`POST /messages/{message_id}/reactions`).
-3. **Joining on a click:**
-   * If any participant wants a transcript of the meeting, they simply click the already-placed 🎙️ reaction (or add it).
-   * The bot watches for the `reaction: add` event on that message:
-     * It starts the background Puppeteer recorder container/process with the extracted URL.
-     * To confirm that recording has started, the bot can add a 🔴 reaction to the message (a visual recording indicator, no text).
-4. **If nobody clicks the reaction:**
-   * The bot does nothing, the call is not recorded, and no server resources are spent.
-5. **Completion and publication:**
-   * When all participants leave Jitsi, the recorder finishes its work.
-   * `faster-whisper` transcribes the recording on CPU.
-   * The document is created in Outline.
-   * Only then does the bot post the final message with the link to the transcript into the Zulip topic:
-     ```markdown
-     🎙️ **The meeting transcript is ready!**
-
-     📄 Document in Outline: [Open the transcript](https://outline.your-domain.com/doc/...)
-
-     <details>
-     <summary>Short preview</summary>
-
-     [00:00] ...
-     </details>
-     ```
+* [`korjavin/transcriber`](https://github.com/korjavin/transcriber) — takes
+  `recording.finished` and transcribes the audio on CPU.
+* [`korjavin/tr2outline`](https://github.com/korjavin/tr2outline) — publishes the
+  finished transcript into Outline and calls back.
 
 ---
 
-## 📁 Project structure (recommended template)
+## 2. What it looks like in Zulip
+
+An unobtrusive, semi-automatic flow: no service messages in the chat, and no
+accidental recordings of short calls.
+
+1. **Call detection.** The bot is subscribed to the Zulip event queue. When
+   someone starts a video call, Zulip posts a message with a link to the Jitsi
+   room. The bot matches it against `JITSI_BASE_URL` and extracts the room URL
+   and the message id.
+2. **A quiet offer.** The bot posts **no text**. It adds a 🎙️
+   (`studio_microphone`) reaction to the call message itself.
+3. **Recording on a click.** Anyone who wants a transcript clicks that reaction.
+   The bot starts the recorder for the extracted URL and adds a 🔴
+   (`red_circle`) reaction as a "recording now" indicator. A second click while
+   the same job runs is a silent no-op.
+4. **Admission.** The bot joins as `NoteTaker`, muted and camera-off. On a
+   lobby-enabled room (public `meet.jit.si` included) a **human has to admit it**
+   — until then it waits, up to `JOIN_TIMEOUT_S`.
+5. **Nobody clicks.** Nothing happens, nothing is recorded, no resources spent.
+6. **Completion.** When everyone leaves, the recorder finalizes the file, the 🔴
+   indicator is removed and the webhook goes out. The "transcript ready" message
+   arrives later, in the same topic, via `POST /notify` from downstream.
+
+Failures are reported as one English line in the job's topic:
+
+| cause | message |
+|---|---|
+| `not_admitted` | NoteTaker was not admitted to the call (or nobody joined) — nothing recorded. |
+| `recorder_failed` | Recording failed (recorder error) — nothing recorded. |
+| `too_short` | Recording too short (under 15 s) — nothing to transcribe. |
+| `interrupted` | Recording was interrupted by a service restart — no transcript. |
+
+---
+
+## 3. How the recording works (research findings)
+
+### Joining a Jitsi call and recording its audio
+
+* **Why not Jitsi Jibri:** Jibri is hard-wired to the internal XMPP control
+  protocol of its own Jitsi server. For joining a public `meet.jit.si` room as a
+  guest it is unusable and excessively heavy.
+* **Chosen approach: headless Chromium + `puppeteer-stream` (Node.js).**
+  It captures the page's incoming audio stream directly through the Chrome
+  DevTools / Extension API, with no virtual display (Xvfb) and no virtual audio
+  server (PulseAudio).
+* **Automatic join without clicking through the UI:** Jitsi settings are passed
+  straight in the URL hash, so the bot never depends on the Jitsi UI:
+
+  ```text
+  https://meet.jit.si/<ROOM_ID>#config.prejoinConfig.enabled=false&config.startWithAudioMuted=true&config.startWithVideoMuted=true&userInfo.displayName="NoteTaker"
+  ```
+
+* **Detecting the end of the meeting:** the recorder polls Jitsi's internal
+  `window.APP` every 2 s. When the bot is the only one left for `EMPTY_GRACE_S`
+  seconds — or `MAX_DURATION_S` is reached, or a `SIGTERM` arrives — the
+  recording is finalized.
+* **Output:** WebM/Opus exactly as Chrome's `MediaRecorder` produces it, no
+  ffmpeg step. `ffprobe` reports `Duration: N/A` on such files; use the
+  `duration_s` field from the recorder's JSON line instead.
+
+### Per-participant tracks
+
+Beyond the mixed conference audio, the recorder is gaining **per-participant
+tracks**: one file per speaker, each with its offset into the call. They surface
+as the optional `tracks` array in the recorder's JSON line, in `job.json` and in
+the webhook payload — consumers must tolerate its absence. See
+[`recorder/README.md`](recorder/README.md) for the recorder's full contract.
+
+---
+
+## 4. Contracts
+
+### (a) Outgoing webhook `recording.finished`
+
+Sent to `WEBHOOK_URL` once a recording finishes successfully. Headers:
 
 ```text
-jitsi2outline/
-├── README.md                 # Documentation and specification (this file)
-├── docker-compose.yml        # Service orchestration
-├── .env.example              # Example environment variables
-├── recorder/                 # Call recording module (Node.js + Puppeteer)
-│   ├── Dockerfile
-│   ├── package.json
-│   └── record.js             # Joins Jitsi and records audio.wav
-├── transcriber/              # Transcription and integrations module (Python)
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── transcribe.py         # faster-whisper processing
-│   ├── outline_client.py     # Client for the Outline API
-│   ├── zulip_bot.py          # Zulip bot for receiving commands and sending results
-│   └── pipeline.py           # Orchestrator: recording -> transcript -> outline -> zulip
-└── data/                     # Temporary storage for audio files (volume)
+x-jitsi-capture-event: recording.finished
+x-jitsi-capture-signature: sha256=<hex>
+Content-Type: application/json
 ```
+
+The signature is `HMAC-SHA256(raw body, WEBHOOK_SECRET)`, lowercase hex. Body:
+
+```json
+{
+  "event": "recording.finished",
+  "id": "123456789",
+  "message_id": 123456789,
+  "stream": "some-stream",
+  "topic": "some topic",
+  "jitsi_url": "https://meet.jit.si/SomeRoom",
+  "audio_path": "/srv/jitsi-capture/data/jobs/123456789/audio.webm",
+  "duration_s": 1834.2,
+  "started_at": "2026-01-01T10:00:00Z",
+  "ended_at": "2026-01-01T10:30:34Z",
+  "participants": ["Alice", "Bob"],
+  "callback_url": "http://jitsi-capture:8080/notify",
+  "tracks": [
+    {"id": "p1", "name": "Alice", "path": "/srv/jitsi-capture/data/jobs/123456789/tracks/p1.webm", "offset_s": 0, "ended_s": 1834.2}
+  ]
+}
+```
+
+`audio_path` (and every `tracks[].path`) is a **host** path — `DATA_DIR` rebased
+onto `HOST_DATA_DIR` — so the receiving service reads the file through its own
+bind mount. `tracks` is omitted when the recorder produced no per-speaker files.
+
+Verifying the signature:
+
+```bash
+# $BODY is the exact raw request body
+printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -r
+# -> <hex>  compare with the header value after "sha256="
+```
+
+Delivery retries on `5 s, 15 s, 45 s, 2 min, 5 min`; anything still undelivered
+is retried by the hourly sweep and after a restart. The receiver must be
+idempotent on `id`.
+
+### (b) `POST /notify`
+
+The callback downstream uses to put a message into the job's Zulip topic.
+
+```http
+POST /notify
+x-jitsi-capture-signature: sha256=<hex>
+Content-Type: application/json
+
+{"id": "123456789", "content": "Transcript ready: <link>"}
+```
+
+Same HMAC over the raw body, same `WEBHOOK_SECRET`. `content` is posted verbatim
+into the stream/topic of job `id`. Responses: `200 {"status":"ok"}` ·
+`400` missing fields · `401` bad signature · `404` unknown job · `502` Zulip
+refused the message.
+
+### (c) `GET /health`
+
+`200 {"status":"ok"}` as soon as the process is serving. No dependency checks.
+
+### (d) State on disk
+
+```text
+DATA_DIR/jobs/<id>/job.json      # id = the Zulip message id
+DATA_DIR/jobs/<id>/audio.webm    # mixed conference audio
+DATA_DIR/jobs/<id>/tracks/       # per-participant files, when available
+```
+
+`job.json` carries `state` (`recording` | `finished` | `failed`), `error`,
+timings, `participants`, `audio_path`, `tracks` and `webhook_sent_at`. It is
+written atomically (temp file + rename), so a crash never leaves a half-written
+record.
+
+* **Retention:** the hourly sweep deletes job directories older than
+  `AUDIO_RETENTION_DAYS` (a job still `recording` is never touched).
+* **Restart:** on startup, jobs left in `recording` are marked `failed` /
+  `interrupted` and reported in Zulip; every `finished` job without
+  `webhook_sent_at` is delivered again. The same sweep re-checks hourly.
 
 ---
 
-## 📋 Tasks for the developer agent
+## 5. Environment variables
 
-1. **Stage 1: Recorder (`recorder/record.js`)**
-   - Implement the Puppeteer script with `puppeteer-stream`.
-   - Verify joining via a test Jitsi link with the URL flags (prejoin disabled, audio/video muted).
-   - Record the audio stream into an `audio.wav` file.
-   - Finish the recording when participants leave or on an external signal.
+`config.go` is the single reader of the environment; there are no flags and no
+dotenv loading — Compose passes `.env` through `env_file`.
 
-2. **Stage 2: Transcriber (`transcriber/transcribe.py`)**
-   - Configure `faster-whisper` on CPU with `int8`.
-   - A function that builds the Markdown text with timecodes.
+| Variable | Default | Meaning |
+|---|---|---|
+| `ZULIP_SITE` | — *(required)* | Zulip base URL, no trailing slash |
+| `ZULIP_BOT_EMAIL` | — *(required)* | Generic bot's email |
+| `ZULIP_BOT_API_KEY` | — *(required)* | Generic bot's API key |
+| `JITSI_BASE_URL` | `https://meet.jit.si` | Only links under this URL are offered a recording |
+| `DATA_DIR` | `/data` | Container path; jobs live in `DATA_DIR/jobs/<id>/` |
+| `HOST_DATA_DIR` | = `DATA_DIR` | Host path of the bind mount; used for `audio_path` |
+| `RECORDER_PATH` | `recorder/record.js` | Node recorder (the image sets `/app/recorder/record.js`) |
+| `BOT_DISPLAY_NAME` | `NoteTaker` | Display name in the call |
+| `JOIN_TIMEOUT_S` | `600` | Give up if not admitted within this many seconds |
+| `MAX_DURATION_S` | `14400` | Hard cap on one recording |
+| `EMPTY_GRACE_S` | `60` | Stop after this long alone in the room |
+| `MIN_RECORDING_S` | `15` | Shorter recordings are reported as `too_short` |
+| `AUDIO_RETENTION_DAYS` | `7` | Sweep deletes older jobs; `0` or less keeps everything |
+| `WEBHOOK_URL` | *(empty)* | Empty disables the webhook (logs "webhook disabled") |
+| `WEBHOOK_SECRET` | — | Required when `WEBHOOK_URL` is set; also verifies `POST /notify` |
+| `LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `PUBLIC_URL` | `http://localhost:8080` | `callback_url` = `PUBLIC_URL` + `/notify` |
+| `LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARN` \| `ERROR` |
 
-3. **Stage 3: Outline Client (`transcriber/outline_client.py`)**
-   - Implement the method that creates a document in Outline via the REST API.
-   - Error handling and retrieval of the public/internal link.
+Secrets are never logged — only the variable **name** appears in an error.
 
-4. **Stage 4: Zulip Bot & Pipeline (`transcriber/zulip_bot.py`)**
-   - Implement handling of incoming messages: parsing the Jitsi call URL.
-   - Starting the Puppeteer container/process.
-   - Sending the final message with the result into the thread.
+---
 
-5. **Stage 5: Docker Compose**
-   - Package everything into a single `docker-compose.yml` for deployment on a local server.
+## 6. Deployment
+
+One image contains the Go service, Node and Chromium; `docker-compose.yml` is
+the whole deployment.
+
+### Zulip bot
+
+1. Settings → Personal → **Bots** → *Add a new bot*, type **Generic**. Note the
+   bot email and API key.
+2. **Subscribe the bot** to every stream whose calls should be recordable — it
+   only sees messages in streams it is subscribed to.
+3. The bot needs no admin rights: it reads messages and adds reactions.
+
+### Run it
+
+```bash
+cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR
+docker compose up -d --build
+docker compose logs -f
+```
+
+With **Portainer**, deploy as a git-ops stack: point a stack at this repository,
+let Portainer build the image, and set the same variables in the stack's
+environment — no `.env` file is needed there, `docker-compose.yml` passes every
+variable through from whatever environment Compose runs in. The parts that
+matter:
+
+* **`HOST_DATA_DIR` bind mount** — job state and audio must survive a redeploy.
+  Create the directory on the host first (`mkdir -p /srv/jitsi-capture/data`).
+* **`shm_size: 1g`** — Chromium crashes on longer calls with Docker's 64 MB
+  default `/dev/shm`.
+* **`stop_grace_period: 120s`** — lets an in-flight recording finalize its file
+  and deliver its webhook on `SIGTERM`. Do not lower it.
+* **RAM** — roughly 400–800 MB per concurrent recording (one Chromium each).
+* Port `8080` only has to be reachable by the sibling `transcriber` /
+  `tr2outline`; it needs no public exposure.
+
+### Smoke checklist
+
+1. Start a call in a subscribed Zulip stream (the call button posts the link).
+2. A 🎙️ reaction appears on the message within a second or two.
+3. Click it → a 🔴 reaction appears.
+4. **Admit `NoteTaker`** from the Jitsi lobby (a human has to do this).
+5. Talk for more than 15 seconds, then everyone leaves the call.
+6. `HOST_DATA_DIR/jobs/<message-id>/job.json` shows `"state": "finished"` with a
+   non-zero `duration_s`, next to `audio.webm`; the receiver logs the
+   `recording.finished` webhook. The 🔴 reaction is gone.
+
+---
+
+## 7. Development
+
+```bash
+# Go service
+gofmt -l . && go vet ./... && go test -race ./...
+
+# Node recorder (PUPPETEER_SKIP_DOWNLOAD=1 avoids a ~150 MB Chrome download)
+cd recorder && PUPPETEER_SKIP_DOWNLOAD=1 npm ci && npm test
+
+# Image + compose file
+docker build -t jitsi-capture .
+cp .env.example .env && docker compose config -q
+```
+
+Tests run offline — no Zulip, no Jitsi, no network: HTTP boundaries use
+`net/http/httptest` and the recorder subprocess is a fake shell script. CI
+(`.github/workflows/ci.yml`) runs the same three jobs (`go` / `node` / `docker`)
+on every pull request. The Go side is a flat `package main` at the repository
+root and is **stdlib-only** — no new dependencies.

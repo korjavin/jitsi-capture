@@ -82,7 +82,7 @@ boundaries and a fake recorder shell script for the subprocess.
 
 ```
 Zulip 🎙️ reaction -> jitsi-capture records the Jitsi call -> audio under DATA_DIR
-  -> signed `recording.finished` webhook -> transcribetor (CPU transcription)
+  -> signed `recording.finished` webhook -> transcriber (CPU transcription)
   -> Anarlog-format webhook -> tr2outline (Outline publisher)
   -> callback POST /notify on jitsi-capture -> "transcript ready" in the Zulip topic
 ```
