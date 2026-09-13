@@ -38,6 +38,25 @@ Exactly one JSON line, on success only:
 All logs go to **stderr**, each line prefixed with an ISO timestamp. The room
 name is logged, never the full URL — it may carry a JWT or a password.
 
+The lines below are the **state transitions**: the service drains stderr and
+logs these at INFO (everything else at DEBUG), so an operator running at INFO
+sees the whole call without turning debug logging on. Matching is by substring —
+`runner.go`'s `recorderMilestones` — so keep the wording stable.
+
+| line | when |
+|------|------|
+| `joining room <room> as <name>` | the page is about to load |
+| `state: waiting_in_lobby` / `state: joined` | the join phase changes |
+| `conference mode: p2p\|jvb\|unknown` | once, right after joining |
+| `remote audio tracks: <n>` | the number of remote audio tracks Jitsi reports changes |
+| `track attached <id> name=<name> muted=<bool>` | a `MediaRecorder` started on a remote track |
+| `track detached <id> reason=<left\|stopping>` | that recorder was stopped |
+| `stopping: <reason>` | the mixed recording is being finalized |
+| `wrote <bytes> bytes in <s>s, <n> participant(s)` | the file is on disk |
+
+`remote audio tracks` versus `track attached` is what separates "Jitsi never
+offered the track" from "attaching it failed" when a call ends with no tracks.
+
 ### Exit codes
 
 | code | meaning |

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -196,6 +197,8 @@ func (r *Runner) run(job Job, rec *recording) {
 				r.termLocked(job.ID, rec)
 			}
 			r.mu.Unlock()
+			slog.Info("recording started", "job", job.ID, "stream", job.Stream,
+				"topic", job.Topic, "room", roomName(job.JitsiURL))
 
 			tail = drainStderr(stderr, job.ID)
 			err = cmd.Wait()
@@ -212,6 +215,10 @@ func (r *Runner) run(job Job, rec *recording) {
 		failJob(&job, errRecorderFailed, code, tail)
 	default:
 		res, perr := parseResult(stdout.Bytes())
+		if perr == nil {
+			slog.Info("recorder finished", "job", job.ID, "exit_code", code, "reason", res.Reason,
+				"duration_s", res.DurationS, "participants", len(res.Participants), "tracks", len(res.Tracks))
+		}
 		switch {
 		case perr != nil:
 			slog.Error("recorder output unparsable", "job", job.ID, "err", perr)
@@ -234,8 +241,12 @@ func (r *Runner) settle(job Job) {
 	err := r.saveFinalState(job)
 	r.announce(job, err)
 
-	if job.State == JobFinished && r.onFinished != nil {
-		r.onFinished(job)
+	if job.State == JobFinished {
+		slog.Info("job finished", "job", job.ID, "duration_s", job.DurationS,
+			"audio_path", job.AudioPath, "tracks", len(job.Tracks))
+		if r.onFinished != nil {
+			r.onFinished(job)
+		}
 	}
 }
 
@@ -552,15 +563,38 @@ func parseResult(stdout []byte) (recResult, error) {
 	return res, errors.New("recorder printed no output")
 }
 
-// drainStderr logs every recorder stderr line at debug and keeps the last few
-// for the failure log.
+// recorderMilestones are the substrings that mark a recorder stderr line as a
+// state transition: the join/lobby/record/stop timeline plus the per-participant
+// capture one. Those go to INFO so an operator sees what the bot did; the rest
+// of the recorder's chatter stays at Debug.
+var recorderMilestones = []string{
+	"joining room", "waiting_in_lobby", "joined", "stopping", "wrote",
+	"conference mode", "remote audio tracks", "track attached", "track detached",
+}
+
+// isMilestone reports whether a recorder stderr line is one of those.
+func isMilestone(line string) bool {
+	for _, m := range recorderMilestones {
+		if strings.Contains(line, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// drainStderr logs every recorder stderr line — state transitions at info, the
+// rest at debug — and keeps the last few for the failure log.
 func drainStderr(r io.Reader, id string) []string {
 	var tail []string
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
-		slog.Debug("recorder", "job", id, "line", line)
+		if isMilestone(line) {
+			slog.Info("recorder", "job", id, "line", line)
+		} else {
+			slog.Debug("recorder", "job", id, "line", line)
+		}
 		tail = append(tail, line)
 		if len(tail) > stderrTailLines {
 			tail = tail[1:]
@@ -574,6 +608,21 @@ func failJob(job *Job, reason string, code int, tail []string) {
 	job.Error = reason
 	slog.Error("recording failed", "job", job.ID, "reason", reason,
 		"exit_code", code, "stderr", strings.Join(tail, "\n"))
+}
+
+// roomName is the last path segment of a Jitsi URL — the mirror of the
+// recorder's roomName(). The URL itself may carry a JWT or a room password, so
+// logs only ever get this much of it.
+func roomName(raw string) string {
+	u, err := url.Parse(raw) // a query or fragment lands in its own field, never in Path
+	if err != nil {
+		return "(unparseable-url)"
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if name := segs[len(segs)-1]; name != "" {
+		return name
+	}
+	return "(root)"
 }
 
 // exitCode is the child's exit status; -1 when it could not be run at all.

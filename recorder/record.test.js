@@ -112,6 +112,7 @@ const {
   trackFile,
   trackPath,
   applyTrackEvents,
+  trackEventLines,
   toJsonl,
   manifestRow,
   resultLine,
@@ -405,4 +406,45 @@ test('finish clamps a track that outlives the mixed recording', async () => {
     [[1, 30]]
   );
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('trackEventLines is the capture timeline an operator reads at INFO', () => {
+  assert.deepStrictEqual(
+    trackEventLines([
+      { type: 'count', n: 1, t: 0.5 },
+      { type: 'start', id: 'p1', key: 'p1#a', name: 'Alice', muted: true, t: 0.6 },
+      { type: 'name', id: 'p1', key: 'p1#a', name: 'Alice B' },
+      { type: 'speaker', id: 'p1', name: 'Alice B', t: 2 },
+      { type: 'end', id: 'p1', key: 'p1#a', reason: 'left', t: 9 },
+      { type: 'count', n: 0, t: 9 },
+    ]),
+    [
+      'remote audio tracks: 1',
+      'track attached p1 name=Alice muted=true',
+      'track detached p1 reason=left',
+      'remote audio tracks: 0',
+    ]
+  );
+});
+
+test('trackEventLines fills in what an event did not carry', () => {
+  assert.deepStrictEqual(
+    trackEventLines([
+      { type: 'start', id: 'p2', key: 'p2#a', t: 1 },
+      { type: 'end', id: 'p2', key: 'p2#a', t: 2 },
+    ]),
+    ['track attached p2 name= muted=false', 'track detached p2 reason=unknown']
+  );
+});
+
+test('applyTrackEvents ignores the count events that only reach the log', () => {
+  const tracks = new Map();
+  const speakers = applyTrackEvents(
+    tracks,
+    [{ type: 'count', n: 2, t: 0 }],
+    '/tmp/tr',
+    new Map()
+  );
+  assert.deepStrictEqual(speakers, []);
+  assert.strictEqual(tracks.size, 0);
 });

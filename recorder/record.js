@@ -142,6 +142,14 @@ function readJitsiState() {
     knocking: !!(lobby && lobby.knocking),
     // membersCount counts the bot itself; listMembers() is remote-only.
     membersCount: read(() => conference.membersCount, 0),
+    // Which transport the call is on. A P2P call swaps the remote track set out
+    // from under per-participant capture, so "zero tracks" reads very
+    // differently depending on this. null when neither source is readable.
+    p2p: read(() => {
+      const c = state && state['features/base/conference'];
+      const v = c && c.p2p;
+      return typeof v === 'boolean' ? v : conference._room.p2p;
+    }, null),
     participants: read(
       () =>
         conference
@@ -161,8 +169,10 @@ function readJitsiState() {
  *
  * It attaches a MediaRecorder to each remote participant's audio track, drops
  * the ones whose owner left, and returns the events queued since the previous
- * call: {type:'start'|'end'|'name'|'speaker', id, key?, name?, t?} with `t` in
- * seconds since the mixed recording started. `key` identifies one attach — it
+ * call: {type:'start'|'end'|'name'|'speaker'|'count', id?, key?, name?, muted?,
+ * reason?, n?, t?} with `t` in seconds since the mixed recording started.
+ * 'count' carries no key and only ever reaches the log, not the manifest —
+ * applyTrackEvents skips it. `key` identifies one attach — it
  * is what chunks are labelled with, so a second attach for the same
  * participant cannot append onto the first one's file. `stop` finalizes every
  * recorder and resolves once the last chunk has reached Node.
@@ -180,6 +190,7 @@ function pollTracks(startedAtMs, stop) {
     events: [],
     dominant: null,
     ctx: null,
+    count: -1, // remote audio tracks last reported; -1 so the first poll reports
   });
   const SETTLE_MS = 4000; // ceiling on each stage of the stop handshake
   const at = () => (Date.now() - startedAtMs) / 1000;
@@ -198,13 +209,13 @@ function pollTracks(startedAtMs, stop) {
       return p && (p.name || p.displayName);
     }, '') || '';
 
-  const end = (id) => {
+  const end = (id, reason) => {
     const a = st.active.get(id);
     if (!a) return;
     st.active.delete(id);
     read(() => a.rec.stop());
     read(() => a.src.disconnect());
-    st.events.push({ type: 'end', id, key: a.key, t: at() });
+    st.events.push({ type: 'end', id, key: a.key, reason, t: at() });
   };
 
   if (stop) {
@@ -218,7 +229,7 @@ function pollTracks(startedAtMs, stop) {
         a.rec.onstop = res;
         setTimeout(res, SETTLE_MS);
       });
-      end(id);
+      end(id, 'stopping');
       return done;
     });
     const settle = (p) => Promise.race([p, new Promise((res) => setTimeout(res, SETTLE_MS))]);
@@ -240,12 +251,22 @@ function pollTracks(startedAtMs, stop) {
   // Remote audio streams by participant id. Somebody who joined muted has no
   // audio track yet — skip them and pick them up on a later poll.
   const streams = new Map();
+  const mutedById = new Map();
+  let remoteAudio = 0;
   for (const t of read(() => state()['features/base/tracks'], []) || []) {
     if (!t || t.mediaType !== 'audio' || t.local || !t.participantId) continue;
     if (!visible(t.participantId)) continue;
+    remoteAudio++;
+    mutedById.set(t.participantId, !!t.muted);
     const s =
       read(() => t.jitsiTrack.getOriginalStream(), null) || read(() => t.jitsiTrack.stream, null);
     if (s && read(() => s.getAudioTracks().length, 0) > 0) streams.set(t.participantId, s);
+  }
+  // What Jitsi reports, not what we managed to attach: a call that ends with no
+  // track files is a different bug depending on which of the two was zero.
+  if (remoteAudio !== st.count) {
+    st.count = remoteAudio;
+    st.events.push({ type: 'count', n: remoteAudio, t: at() });
   }
 
   for (const [id, s] of streams) {
@@ -287,7 +308,14 @@ function pollTracks(startedAtMs, stop) {
       return true;
     }, false);
     if (started) {
-      st.events.push({ type: 'start', id, key, name: nameOf(id), t: at() });
+      st.events.push({
+        type: 'start',
+        id,
+        key,
+        name: nameOf(id),
+        muted: !!mutedById.get(id),
+        t: at(),
+      });
     } else {
       // One attempt per participant: retrying every 2 s would leak a connected
       // node pair each time, and an out-of-memory renderer would take the mixed
@@ -313,7 +341,7 @@ function pollTracks(startedAtMs, stop) {
         a.stream = s;
       });
     } else if (!s && !visible(id)) {
-      end(id);
+      end(id, 'left');
     }
   }
 
@@ -420,6 +448,28 @@ function applyTrackEvents(tracks, events, dir, files) {
   return speakers;
 }
 
+/**
+ * The stderr timeline for per-participant capture: how many remote audio tracks
+ * Jitsi reported, which of them we attached a recorder to (and whether the mic
+ * was muted at the time), and which went away and why. Without these a call that
+ * produced no track files gives an operator nothing to tell "the track was never
+ * in features/base/tracks" from "attaching it failed". Pure so it stays testable;
+ * runner.go promotes the lines it returns to INFO.
+ */
+function trackEventLines(events) {
+  const lines = [];
+  for (const e of events) {
+    if (e.type === 'start') {
+      lines.push(`track attached ${e.id} name=${e.name || ''} muted=${!!e.muted}`);
+    } else if (e.type === 'end') {
+      lines.push(`track detached ${e.id} reason=${e.reason || 'unknown'}`);
+    } else if (e.type === 'count') {
+      lines.push(`remote audio tracks: ${e.n}`);
+    }
+  }
+  return lines;
+}
+
 /** JSONL body for a list of objects; '' for an empty list, never a bare "\n". */
 const toJsonl = (rows) => rows.map((r) => `${JSON.stringify(r)}\n`).join('');
 
@@ -480,6 +530,7 @@ async function setupTracks(page, tracksDir, startedAt) {
       // timeout here would drop them for good. The page bounds its own stop
       // handshake, and the poll is no more blocking than readJitsiState.
       const events = await page.evaluate(pollTracks, startedAt, !!stop);
+      for (const l of trackEventLines(events)) log(l);
       const lines = toJsonl(applyTrackEvents(tracks, events, dir, files));
       if (lines) fs.appendFileSync(speakersPath, lines);
     } catch (e) {
@@ -595,6 +646,7 @@ async function main(argv) {
       }
       if (state.joined) {
         joined = true;
+        log(`conference mode: ${state.p2p == null ? 'unknown' : state.p2p ? 'p2p' : 'jvb'}`);
         break;
       }
       await sleep(POLL_MS);
@@ -724,6 +776,7 @@ module.exports = {
   setupTracks,
   trackFile,
   applyTrackEvents,
+  trackEventLines,
   toJsonl,
   manifestRow,
   resultLine,
