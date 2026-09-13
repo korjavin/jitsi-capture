@@ -29,8 +29,13 @@ const (
 // ponytail: fixed table; unsent jobs are retried hourly by the sweep anyway.
 var backoff = []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second, 2 * time.Minute, 5 * time.Minute}
 
-// webhookClient is the client every delivery attempt uses.
-var webhookClient = &http.Client{Timeout: 30 * time.Second}
+// webhookClient is the client every delivery attempt uses. Redirects are not
+// followed: net/http would turn a 30x into a GET without the signed body, and a
+// 200 on that would look like a delivery that never happened.
+var webhookClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 // signBody is the HMAC-SHA256 of the raw body, in tr2outline's format:
 // "sha256=" + lowercase hex.

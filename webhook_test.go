@@ -200,6 +200,19 @@ func TestSendWebhookGivesUp(t *testing.T) {
 	}
 }
 
+// A redirect must not be followed: net/http would drop the signed body and a
+// 200 at the end of the hop would hide a failed delivery.
+func TestSendWebhookDoesNotFollowRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, "/login", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	if err := sendWebhook(context.Background(), webhookConfig(srv.URL), finishedJob()); err == nil {
+		t.Fatal("sendWebhook: a redirect must be reported as a failed delivery")
+	}
+}
+
 func TestSendWebhookDisabled(t *testing.T) {
 	// An empty WebhookURL must not even be dialled; a bad URL would error out.
 	cfg := webhookConfig("")
