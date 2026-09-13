@@ -50,10 +50,6 @@ const NUMERIC = new Set(['joinTimeout', 'maxDuration', 'emptyGrace']);
 
 const POLL_MS = 2000;
 const FLUSH_MS = 5000;
-// Grace for the last MediaRecorder chunk of every per-participant track to make
-// it back over page.exposeFunction after we stop the recorders.
-// ponytail: a fixed wait; the alternative is an ack protocol across the bridge.
-const TRACK_FLUSH_MS = 1500;
 
 /** Parse argv (without node/script). Throws on anything the contract rejects. */
 function parseArgs(argv) {
@@ -74,6 +70,17 @@ function parseArgs(argv) {
   }
   if (!opts.url) throw new Error('missing required --url');
   if (!opts.out) throw new Error('missing required --out');
+  if (opts.tracksDir) {
+    // The tracks directory is emptied on startup, so it must not be — or
+    // contain — the directory the recording itself is written to.
+    const outDir = path.dirname(path.resolve(opts.out));
+    const tracksDir = path.resolve(opts.tracksDir);
+    // The root directory already ends in a separator; everything else needs one.
+    const prefix = tracksDir.endsWith(path.sep) ? tracksDir : tracksDir + path.sep;
+    if (outDir === tracksDir || outDir.startsWith(prefix)) {
+      throw new Error('--tracks-dir must not contain the --out directory');
+    }
+  }
   return opts;
 }
 
@@ -154,8 +161,11 @@ function readJitsiState() {
  *
  * It attaches a MediaRecorder to each remote participant's audio track, drops
  * the ones whose owner left, and returns the events queued since the previous
- * call: {type:'start'|'end'|'name'|'speaker', id, name?, t?} with `t` in
- * seconds since the mixed recording started. `stop` finalizes every recorder.
+ * call: {type:'start'|'end'|'name'|'speaker', id, key?, name?, t?} with `t` in
+ * seconds since the mixed recording started. `key` identifies one attach — it
+ * is what chunks are labelled with, so a second attach for the same
+ * participant cannot append onto the first one's file. `stop` finalizes every
+ * recorder and resolves once the last chunk has reached Node.
  *
  * Every read is guarded the same way readJitsiState() is: a throw out of here
  * would mean a dead page, and per-participant audio must never cost us the
@@ -166,10 +176,12 @@ function pollTracks(startedAtMs, stop) {
     active: new Map(),
     names: new Map(),
     failed: new Set(),
+    pending: new Set(),
     events: [],
     dominant: null,
     ctx: null,
   });
+  const SETTLE_MS = 4000; // ceiling on each stage of the stop handshake
   const at = () => (Date.now() - startedAtMs) / 1000;
   const read = (fn, fallback) => {
     try {
@@ -192,19 +204,45 @@ function pollTracks(startedAtMs, stop) {
     st.active.delete(id);
     read(() => a.rec.stop());
     read(() => a.src.disconnect());
-    st.events.push({ type: 'end', id, t: at() });
+    st.events.push({ type: 'end', id, key: a.key, t: at() });
   };
 
   if (stop) {
-    for (const id of [...st.active.keys()]) end(id);
-    return st.events.splice(0);
+    // onstop fires after the recorder's final ondataavailable, and every
+    // __trackChunk promise resolves once Node has appended that chunk, so this
+    // hands back only once the files on disk are complete. Both stages are
+    // bounded: a recorder that never fires must not hang finalization.
+    const stopped = [...st.active.keys()].map((id) => {
+      const a = st.active.get(id);
+      const done = new Promise((res) => {
+        a.rec.onstop = res;
+        setTimeout(res, SETTLE_MS);
+      });
+      end(id);
+      return done;
+    });
+    const settle = (p) => Promise.race([p, new Promise((res) => setTimeout(res, SETTLE_MS))]);
+    return settle(Promise.all(stopped))
+      .then(() => settle(Promise.allSettled([...st.pending])))
+      .then(() => st.events.splice(0));
   }
+
+  // The roster is also the hidden-participant filter: transcriber/SIP ghosts
+  // are left out of participants[] too, and must not get a track file.
+  const roster = read(() => state()['features/base/participants'].remote, null);
+  const visible = (id) =>
+    !roster ||
+    read(() => {
+      const p = roster.get(id);
+      return !!p && !p.isHidden;
+    }, false);
 
   // Remote audio streams by participant id. Somebody who joined muted has no
   // audio track yet — skip them and pick them up on a later poll.
   const streams = new Map();
   for (const t of read(() => state()['features/base/tracks'], []) || []) {
     if (!t || t.mediaType !== 'audio' || t.local || !t.participantId) continue;
+    if (!visible(t.participantId)) continue;
     const s =
       read(() => t.jitsiTrack.getOriginalStream(), null) || read(() => t.jitsiTrack.stream, null);
     if (s && read(() => s.getAudioTracks().length, 0) > 0) streams.set(t.participantId, s);
@@ -213,6 +251,10 @@ function pollTracks(startedAtMs, stop) {
   for (const [id, s] of streams) {
     if (st.active.has(id) || st.failed.has(id)) continue;
     let src = null;
+    // Unique per attach, and not derived from any counter: Jitsi reloads the
+    // page on a fatal connection error, which wipes this state while the
+    // participant ids survive.
+    const key = `${id}#${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const started = read(() => {
       if (!st.ctx) st.ctx = new (window.AudioContext || window.webkitAudioContext)();
       // Needs --autoplay-policy=no-user-gesture-required, or it stays suspended.
@@ -226,23 +268,26 @@ function pollTracks(startedAtMs, stop) {
       const rec = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' });
       rec.ondataavailable = (e) => {
         if (!e.data || !e.data.size) return;
-        e.data
+        // Tracked so the stop handshake can wait for the last chunk to land.
+        const sent = e.data
           .arrayBuffer()
           .then((b) => {
             // exposeFunction only carries strings, so base64 it is.
             const u8 = new Uint8Array(b);
             let bin = '';
             for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
-            return window.__trackChunk(id, btoa(bin));
+            return window.__trackChunk(key, btoa(bin));
           })
           .catch(() => {});
+        st.pending.add(sent);
+        sent.then(() => st.pending.delete(sent));
       };
       rec.start(1000);
-      st.active.set(id, { rec, src, dest, stream: s });
+      st.active.set(id, { rec, src, dest, stream: s, key });
       return true;
     }, false);
     if (started) {
-      st.events.push({ type: 'start', id, name: nameOf(id), t: at() });
+      st.events.push({ type: 'start', id, key, name: nameOf(id), t: at() });
     } else {
       // One attempt per participant: retrying every 2 s would leak a connected
       // node pair each time, and an out-of-memory renderer would take the mixed
@@ -255,8 +300,9 @@ function pollTracks(startedAtMs, stop) {
   // A track that disappears while its owner is still in the room (a mute, a
   // P2P/bridge switch, a renegotiation) must not end the recording: the
   // MediaRecorder keeps running on the AudioContext, so the gap stays in the
-  // file as silence and offset_s remains valid for the whole track.
-  const inRoom = read(() => state()['features/base/participants'].remote, null);
+  // file as silence and offset_s remains valid for the whole track. An
+  // unreadable roster counts as "still here" for the same reason; the stop
+  // pass ends everything regardless.
   for (const [id, a] of [...st.active]) {
     const s = streams.get(id);
     if (s && s !== a.stream) {
@@ -266,17 +312,17 @@ function pollTracks(startedAtMs, stop) {
         a.src.connect(a.dest);
         a.stream = s;
       });
-    } else if (!s && (!inRoom || !inRoom.has(id))) {
+    } else if (!s && !visible(id)) {
       end(id);
     }
   }
 
   // A display name often lands after the track does; report it when it changes.
-  for (const id of st.active.keys()) {
+  for (const [id, a] of st.active) {
     const name = nameOf(id);
     if (name && name !== st.names.get(id)) {
       st.names.set(id, name);
-      st.events.push({ type: 'name', id, name });
+      st.events.push({ type: 'name', id, key: a.key, name });
     }
   }
 
@@ -310,27 +356,56 @@ const trackFile = (dir, id) =>
   path.join(dir, `${String(id).replace(/[^A-Za-z0-9_-]/g, '_')}.webm`);
 
 /**
- * Fold page events into `tracks` (id -> manifest record, first-seen order) and
- * return the dominant-speaker lines to append. Pure: no fs, no browser.
+ * The file one attach key writes to, allocated once and remembered in `files`.
+ * A participant's first attach gets `<id>.webm`; a later one — the page
+ * reloaded mid-call — gets `<id>_2.webm` rather than appending a second WebM
+ * document onto the first, which no decoder would read past.
  */
-function applyTrackEvents(tracks, events, dir) {
+function trackPath(dir, files, key) {
+  let file = files.get(key);
+  if (!file) {
+    const id = String(key).split('#')[0];
+    const seen = [...files.keys()].filter((k) => String(k).split('#')[0] === id).length;
+    file = trackFile(dir, seen ? `${id}_${seen + 1}` : id);
+    files.set(key, file);
+  }
+  return file;
+}
+
+/**
+ * Fold page events into `tracks` (attach key -> manifest record, first-seen
+ * order), allocating files through `files`, and return the dominant-speaker
+ * lines to append. Pure apart from those two maps: no fs, no browser.
+ */
+function applyTrackEvents(tracks, events, dir, files) {
   const speakers = [];
   for (const e of events) {
     if (e.type === 'speaker') {
       speakers.push({ t_s: round3(e.t), id: e.id, name: e.name || '' });
       continue;
     }
-    const rec = tracks.get(e.id);
+    const rec = tracks.get(e.key);
     if (e.type === 'start') {
-      // A rejoin gets a fresh participant id, so an id we already know keeps its
-      // original offset and its file.
+      // Keyed by attach, not by participant: a rejoin (new id) and a re-attach
+      // of the same id both get their own record, file and offset.
       if (!rec) {
-        tracks.set(e.id, {
+        // A page reload takes the old recorder down without an end event, so
+        // close any record of this participant still open — the new attach is
+        // the best estimate we have of when the old one died. Left at its
+        // offset it would look empty, and a consumer would skip the audio.
+        for (const t of tracks.values()) {
+          if (t.id === e.id && t.open) {
+            t.ended_s = round3(e.t);
+            t.open = false;
+          }
+        }
+        tracks.set(e.key, {
           id: e.id,
           name: e.name || '',
-          path: path.resolve(trackFile(dir, e.id)),
+          path: path.resolve(trackPath(dir, files, e.key)),
           offset_s: round3(e.t),
           ended_s: round3(e.t),
+          open: true,
         });
       }
     } else if (!rec) {
@@ -339,6 +414,7 @@ function applyTrackEvents(tracks, events, dir) {
       rec.name = e.name || rec.name;
     } else if (e.type === 'end') {
       rec.ended_s = round3(e.t);
+      rec.open = false;
     }
   }
   return speakers;
@@ -374,19 +450,21 @@ async function setupTracks(page, tracksDir, startedAt) {
   if (!tracksDir) return null;
   const dir = path.resolve(tracksDir);
   const tracks = new Map();
+  const files = new Map(); // attach key -> file, so chunks and manifest agree
   try {
     // Truncate semantics, like --out: a re-recorded job reuses its directory,
     // and appending onto the previous run's files would glue two calls together.
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
-    await page.exposeFunction('__trackChunk', (id, b64) => {
+    // The page awaits this, so the returned promise is the chunk's ack.
+    await page.exposeFunction('__trackChunk', (key, b64) => {
       try {
         // A chunked MediaRecorder WebM stays playable appended chunk by chunk —
         // the first one carries the header. Do not re-mux.
         // ponytail: synchronous, so concurrent chunks cannot interleave inside
         // one file; if N participants ever make this block the mixed write, the
         // upgrade is a per-file async queue, not plain fs.appendFile.
-        fs.appendFileSync(trackFile(dir, id), Buffer.from(b64, 'base64'));
+        fs.appendFileSync(trackPath(dir, files, key), Buffer.from(b64, 'base64'));
       } catch (e) {
         log(`track write failed: ${scrub(e.message)}`);
       }
@@ -398,13 +476,11 @@ async function setupTracks(page, tracksDir, startedAt) {
   const speakersPath = path.join(dir, 'speakers.jsonl');
   const pump = async (stop) => {
     try {
-      // Bounded: a wedged renderer must not hang the finalization path, where
-      // the JSON line and the exit code are still waiting to be produced.
-      const events = await Promise.race([
-        page.evaluate(pollTracks, startedAt, !!stop),
-        sleep(POLL_MS).then(() => []),
-      ]);
-      const lines = toJsonl(applyTrackEvents(tracks, events, dir));
+      // Never race this: pollTracks hands the events over destructively, so a
+      // timeout here would drop them for good. The page bounds its own stop
+      // handshake, and the poll is no more blocking than readJitsiState.
+      const events = await page.evaluate(pollTracks, startedAt, !!stop);
+      const lines = toJsonl(applyTrackEvents(tracks, events, dir, files));
       if (lines) fs.appendFileSync(speakersPath, lines);
     } catch (e) {
       log(`track poll failed: ${scrub(e.message)}`);
@@ -413,10 +489,20 @@ async function setupTracks(page, tracksDir, startedAt) {
   await pump(false); // attach to whoever is already in the room
   return {
     pump,
-    async finish() {
+    /** `endS` is the duration reported for the mixed file; see the clamp below. */
+    async finish(endS) {
       await pump(true);
-      await sleep(TRACK_FLUSH_MS);
       const list = [...tracks.values()];
+      // The mixed file stops first and its duration is frozen before the flush,
+      // while these timestamps are wall-clock: without the clamp a track would
+      // claim to run past the recording it belongs to.
+      const cap = round3(endS);
+      for (const t of list) {
+        // Still open here means its end event was lost with the page; the
+        // recording ran to the end as far as anyone can tell.
+        if (t.open || t.ended_s > cap) t.ended_s = cap;
+        delete t.open; // internal, never reported
+      }
       try {
         fs.writeFileSync(path.join(dir, 'tracks.jsonl'), toJsonl(list.map(manifestRow)));
       } catch (e) {
@@ -437,7 +523,10 @@ async function main(argv) {
     return 2;
   }
 
-  fs.mkdirSync(path.dirname(path.resolve(opts.out)), { recursive: true });
+  // Absolute from here on, so the reported `out` and `tracks[].path` have the
+  // same shape whatever the caller passed.
+  opts.out = path.resolve(opts.out);
+  fs.mkdirSync(path.dirname(opts.out), { recursive: true });
 
   // Stop reason is also the signal latch: a second signal exits immediately.
   let reason = null;
@@ -588,7 +677,7 @@ async function main(argv) {
 
     // After the mixed stream is finalized, so per-participant capture cannot
     // stretch audio.webm past the duration_s we are about to report.
-    const trackList = trackCap ? await trackCap.finish() : null;
+    const trackList = trackCap ? await trackCap.finish(durationS) : null;
 
     const size = fs.statSync(opts.out, { throwIfNoEntry: false })?.size ?? 0;
     if (size === 0) {
@@ -627,6 +716,7 @@ module.exports = {
   buildUrl,
   roomName,
   shouldStop,
+  trackPath,
   // pollTracks and setupTracks are exported so the per-participant capture can
   // be driven against a stubbed window.APP in a browser, which is how the audio
   // path is verified without a live conference.

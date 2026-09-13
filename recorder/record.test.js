@@ -110,6 +110,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   trackFile,
+  trackPath,
   applyTrackEvents,
   toJsonl,
   manifestRow,
@@ -121,6 +122,21 @@ test('parseArgs leaves tracksDir unset without the flag, and takes it with', () 
   assert.ok(!('tracksDir' in parseArgs(MIN)), 'the key must be absent, not empty');
   assert.strictEqual(parseArgs([...MIN, '--tracks-dir', '/tmp/tr']).tracksDir, '/tmp/tr');
   assert.throws(() => parseArgs([...MIN, '--tracks-dir']), /missing value/);
+});
+
+test('parseArgs rejects a tracks dir that holds the recording', () => {
+  // setupTracks empties the directory, so these would delete the open audio
+  // file (and everything else the job keeps next to it).
+  const out = ['--url', 'https://jitsi.example.com/r', '--out', '/data/jobs/7/audio.webm'];
+  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data/jobs/7']), /must not contain/);
+  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data/jobs/7/']), /must not contain/);
+  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data']), /must not contain/);
+  assert.throws(() => parseArgs([...out, '--tracks-dir', '/']), /must not contain/);
+  // The real layout — a subdirectory of the job — stays allowed.
+  assert.strictEqual(
+    parseArgs([...out, '--tracks-dir', '/data/jobs/7/tracks']).tracksDir,
+    '/data/jobs/7/tracks'
+  );
 });
 
 test('usage documents --tracks-dir', () => {
@@ -137,16 +153,18 @@ test('applyTrackEvents builds the manifest and the speaker timeline', () => {
   const speakers = applyTrackEvents(
     tracks,
     [
-      { type: 'start', id: 'p1', name: '', t: 1.25 },
-      { type: 'name', id: 'p1', name: 'First' },
+      { type: 'start', id: 'p1', key: 'p1#a', name: '', t: 1.25 },
+      { type: 'name', id: 'p1', key: 'p1#a', name: 'First' },
       { type: 'speaker', id: 'p1', name: 'First', t: 2 },
-      { type: 'start', id: 'p2', name: 'Second', t: 3.5 },
+      { type: 'start', id: 'p2', key: 'p2#a', name: 'Second', t: 3.5 },
       { type: 'speaker', id: 'p2', name: 'Second', t: 4.5 },
-      { type: 'end', id: 'p1', t: 30.125 },
+      { type: 'end', id: 'p1', key: 'p1#a', t: 30.125 },
     ],
-    '/d/tracks'
+    '/d/tracks',
+    new Map()
   );
 
+  // `open` is internal bookkeeping; finish() resolves and drops it.
   assert.deepStrictEqual(
     [...tracks.values()],
     [
@@ -156,6 +174,7 @@ test('applyTrackEvents builds the manifest and the speaker timeline', () => {
         path: path.resolve('/d/tracks/p1.webm'),
         offset_s: 1.25,
         ended_s: 30.125,
+        open: false,
       },
       {
         id: 'p2',
@@ -163,6 +182,7 @@ test('applyTrackEvents builds the manifest and the speaker timeline', () => {
         path: path.resolve('/d/tracks/p2.webm'),
         offset_s: 3.5,
         ended_s: 3.5,
+        open: true,
       },
     ]
   );
@@ -177,31 +197,50 @@ test('applyTrackEvents ignores events for a track it never saw start', () => {
   const speakers = applyTrackEvents(
     tracks,
     [
-      { type: 'end', id: 'ghost', t: 5 },
-      { type: 'name', id: 'ghost', name: 'Nobody' },
+      { type: 'end', id: 'ghost', key: 'ghost#a', t: 5 },
+      { type: 'name', id: 'ghost', key: 'ghost#a', name: 'Nobody' },
     ],
-    '/d'
+    '/d',
+    new Map()
   );
   assert.strictEqual(tracks.size, 0);
   assert.deepStrictEqual(speakers, []);
 });
 
-test('applyTrackEvents keeps the first offset when one id starts twice', () => {
+test('a second attach of one participant gets its own record and file', () => {
+  // The page reloads on a fatal Jitsi error, which restarts the recorders while
+  // the participant ids survive. Appending the new MediaRecorder's header onto
+  // the old file would leave two WebM documents in one file.
   const tracks = new Map();
   applyTrackEvents(
     tracks,
     [
-      { type: 'start', id: 'p1', name: 'First', t: 1 },
-      { type: 'end', id: 'p1', t: 4 },
-      { type: 'start', id: 'p1', name: 'First', t: 6 },
-      { type: 'end', id: 'p1', t: 9 },
+      { type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 1 },
+      { type: 'end', id: 'p1', key: 'p1#a', t: 4 },
+      { type: 'start', id: 'p1', key: 'p1#b', name: 'First', t: 6 },
+      { type: 'end', id: 'p1', key: 'p1#b', t: 9 },
     ],
-    '/d'
+    '/d',
+    new Map()
   );
   assert.deepStrictEqual(
-    [...tracks.values()].map((t) => [t.offset_s, t.ended_s]),
-    [[1, 9]]
+    [...tracks.values()].map((t) => [t.id, t.offset_s, t.ended_s, path.basename(t.path)]),
+    [
+      ['p1', 1, 4, 'p1.webm'],
+      ['p1', 6, 9, 'p1_2.webm'],
+    ]
   );
+});
+
+test('trackPath allocates one file per attach key and is stable per key', () => {
+  const files = new Map();
+  // A chunk can arrive before its start event is polled, so both callers must
+  // resolve the same key to the same file.
+  assert.strictEqual(trackPath('/d', files, 'p1#a'), path.join('/d', 'p1.webm'));
+  assert.strictEqual(trackPath('/d', files, 'p1#a'), path.join('/d', 'p1.webm'));
+  assert.strictEqual(trackPath('/d', files, 'p2#a'), path.join('/d', 'p2.webm'));
+  assert.strictEqual(trackPath('/d', files, 'p1#b'), path.join('/d', 'p1_2.webm'));
+  assert.strictEqual(trackPath('/d', files, 'p1#c'), path.join('/d', 'p1_3.webm'));
 });
 
 test('toJsonl writes one parseable object per line, nothing for an empty list', () => {
@@ -209,10 +248,11 @@ test('toJsonl writes one parseable object per line, nothing for an empty list', 
   applyTrackEvents(
     tracks,
     [
-      { type: 'start', id: 'p1', name: 'First', t: 0.5 },
-      { type: 'end', id: 'p1', t: 12 },
+      { type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 0.5 },
+      { type: 'end', id: 'p1', key: 'p1#a', t: 12 },
     ],
-    '/d'
+    '/d',
+    new Map()
   );
   const body = toJsonl([...tracks.values()].map(manifestRow));
   assert.strictEqual(body.at(-1), '\n');
@@ -278,11 +318,11 @@ test('setupTracks writes the manifests and clears a previous run', async () => {
   const cap = await setupTracks(
     fakePage([
       [
-        { type: 'start', id: 'p1', name: 'First', t: 1 },
+        { type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 1 },
         { type: 'speaker', id: 'p1', name: 'First', t: 1.5 },
       ],
-      [{ type: 'start', id: 'p2', name: 'Second', t: 4 }],
-      [{ type: 'end', id: 'p1', t: 9 }],
+      [{ type: 'start', id: 'p2', key: 'p2#a', name: 'Second', t: 4 }],
+      [{ type: 'end', id: 'p1', key: 'p1#a', t: 9 }],
     ]),
     dir,
     Date.now()
@@ -291,13 +331,14 @@ test('setupTracks writes the manifests and clears a previous run', async () => {
   assert.ok(!fs.existsSync(path.join(dir, 'p1.webm')), 'stale track file survived');
 
   await cap.pump(false);
-  const list = await cap.finish();
+  // p1 ended on its own; p2 never did, so it ran to the end of the recording.
+  const list = await cap.finish(12);
 
   assert.deepStrictEqual(
     list.map((t) => [t.id, t.name, t.offset_s, t.ended_s]),
     [
       ['p1', 'First', 1, 9],
-      ['p2', 'Second', 4, 4],
+      ['p2', 'Second', 4, 12],
     ]
   );
   assert.deepStrictEqual(
@@ -308,10 +349,60 @@ test('setupTracks writes the manifests and clears a previous run', async () => {
       .map(JSON.parse),
     [
       { id: 'p1', name: 'First', offset_s: 1, ended_s: 9 },
-      { id: 'p2', name: 'Second', offset_s: 4, ended_s: 4 },
+      { id: 'p2', name: 'Second', offset_s: 4, ended_s: 12 },
     ]
   );
-  assert.deepStrictEqual(fs.readFileSync(path.join(dir, 'speakers.jsonl'), 'utf8'),
-    '{"t_s":1.5,"id":"p1","name":"First"}\n');
+  assert.deepStrictEqual(
+    fs.readFileSync(path.join(dir, 'speakers.jsonl'), 'utf8'),
+    '{"t_s":1.5,"id":"p1","name":"First"}\n'
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('finish closes tracks whose end event was lost with the page', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tracks-'));
+  const cap = await setupTracks(
+    // A reload mid-call: no end event for either earlier attach, and the ids
+    // come back unchanged.
+    fakePage([
+      [
+        { type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 1 },
+        { type: 'start', id: 'p2', key: 'p2#a', name: 'Second', t: 2 },
+      ],
+      [{ type: 'start', id: 'p1', key: 'p1#b', name: 'First', t: 18 }],
+    ]),
+    dir,
+    Date.now()
+  );
+  const list = await cap.finish(30);
+  assert.deepStrictEqual(
+    list.map((t) => [t.id, t.offset_s, t.ended_s, path.basename(t.path)]),
+    [
+      // Closed at the moment the participant's next attach began...
+      ['p1', 1, 18, 'p1.webm'],
+      // ...and the ones with no successor run to the end of the recording.
+      ['p2', 2, 30, 'p2.webm'],
+      ['p1', 18, 30, 'p1_2.webm'],
+    ]
+  );
+  assert.ok(!('open' in list[0]), 'the internal open flag must not be reported');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('finish clamps a track that outlives the mixed recording', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tracks-'));
+  const cap = await setupTracks(
+    fakePage([
+      [{ type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 1 }],
+      [{ type: 'end', id: 'p1', key: 'p1#a', t: 31.9 }],
+    ]),
+    dir,
+    Date.now()
+  );
+  const list = await cap.finish(30);
+  assert.deepStrictEqual(
+    list.map((t) => [t.offset_s, t.ended_s]),
+    [[1, 30]]
+  );
   fs.rmSync(dir, { recursive: true, force: true });
 });

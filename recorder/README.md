@@ -26,6 +26,8 @@ Exactly one JSON line, on success only:
 {"out":"/data/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["Alice","Bob"]}
 ```
 
+* `out` — absolute, whatever shape `--out` was given in, so it matches the
+  absolute `tracks[].path` below.
 * `reason` — `empty_room` | `signal` | `max_duration`
 * `participants` — display names of non-bot participants seen at any point
   during the recording, deduped, first-seen order. Hidden participants
@@ -71,7 +73,7 @@ With `--tracks-dir <dir>` the recorder also writes, next to the mixed file:
 
 | file | contents |
 |------|----------|
-| `<dir>/<participantId>.webm` | one WebM/Opus file per remote participant, that participant's audio only |
+| `<dir>/<participantId>.webm` | one WebM/Opus file per remote participant, that participant's audio only (`_2`, `_3`… if the recorder had to re-attach mid-call) |
 | `<dir>/tracks.jsonl` | one line per track: `{"id","name","offset_s","ended_s"}` |
 | `<dir>/speakers.jsonl` | dominant-speaker timeline, one line per change: `{"t_s","id","name"}` |
 
@@ -91,7 +93,12 @@ and the stdout JSON gains a `tracks` array with absolute paths:
   `tracks[].path`, which the caller service places at
   `dirname(audio_path)/tracks`.
 * The directory is emptied at startup, the same truncate semantics `--out` has,
-  so re-recording a job cannot append this call onto the previous one.
+  so re-recording a job cannot append this call onto the previous one. For the
+  same reason `--tracks-dir` is rejected when it is, or contains, the directory
+  `--out` writes to.
+* One participant can appear on more than one line: if Jitsi reloads the page
+  mid-call the recorders restart, and each attach gets its own file and its own
+  `offset_s` rather than a second WebM document appended to the first.
 
 How it works: the same 2 s poll walks Jitsi's redux
 `features/base/tracks` for remote audio tracks, and pipes each one through a
@@ -103,7 +110,15 @@ is ever connected to `ctx.destination`, so the mixed tab capture is untouched.
 Chunks cross into Node base64-encoded over `page.exposeFunction` (the bridge
 carries strings only) and are appended to the file as they arrive — a chunked
 MediaRecorder WebM stays playable that way, the first chunk carries the header,
-so **do not re-mux**.
+so **do not re-mux**. Each chunk is labelled with the attach it came from, not
+with the participant id, which is what keeps a restarted recorder out of the
+previous file.
+
+Stopping is a handshake rather than a wait: the final poll stops every recorder,
+waits for each `onstop` (which fires after that recorder's last chunk) and then
+for every outstanding chunk to be acknowledged by Node, so `tracks.jsonl` and
+the stdout line are written over complete files. Both stages are bounded inside
+the page, so a stuck recorder cannot hold up the exit.
 
 A track only ends when its owner leaves the room. If the track itself
 disappears — a mute, a P2P/bridge switch, a renegotiation — the MediaRecorder
@@ -118,6 +133,12 @@ Known limits:
   file; deduplicating by display name is the consumer's job.
 * A participant who joined muted has no audio track yet — the poll picks them up
   when one appears, and their `offset_s` reflects that later start.
+* Hidden participants (transcriber/SIP ghosts) get no track file, matching the
+  way `participants[]` leaves them out.
+* A track whose end event was lost with the page — only a mid-call reload does
+  that — is reported as running either until the participant's next attach or to
+  the end of the recording, whichever comes first. `offset_s` is exact either
+  way; `ended_s` is the estimate.
 * Per-participant capture is best-effort: if it cannot be set up, the failure is
   logged and the mixed recording continues alone. A participant whose recorder
   cannot be attached is skipped for the rest of the call rather than retried
