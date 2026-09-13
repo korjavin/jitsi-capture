@@ -105,15 +105,18 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 		// Offer the recording silently — a reaction, never a text message.
 		if err := b.z.AddReaction(ctx, m.ID, micEmoji); err != nil {
 			slog.Error("adding the microphone reaction failed", "message_id", m.ID, "err", err)
+			return
 		}
+		slog.Info("call link detected", "message_id", m.ID,
+			"stream", string(m.DisplayRecipient), "topic", m.Subject)
 	case ev.Type == "reaction" && ev.Op == "add" && ev.EmojiName == micEmoji && ev.UserID != b.botID:
-		b.startJob(ctx, ev.MessageID)
+		b.startJob(ctx, ev.MessageID, ev.UserID)
 	}
 }
 
 // startJob turns a microphone-reaction click into a recording job. The reaction
 // event carries no content, so the message has to be fetched.
-func (b *Bot) startJob(ctx context.Context, msgID int64) {
+func (b *Bot) startJob(ctx context.Context, msgID, userID int64) {
 	m, err := b.z.GetMessage(ctx, msgID)
 	if err != nil {
 		slog.Error("fetching the reacted message failed", "message_id", msgID, "err", err)
@@ -136,6 +139,7 @@ func (b *Bot) startJob(ctx context.Context, msgID int64) {
 		Topic:     m.Subject,
 		JitsiURL:  roomURL,
 	}
+	slog.Info("recording requested", "job", job.ID, "user_id", userID)
 	// The recording indicator is the runner's (see syncIndicator). A second
 	// click on a live recording is a silent no-op for the user.
 	if err := b.start(job); err != nil && !errors.Is(err, ErrDuplicateJob) {

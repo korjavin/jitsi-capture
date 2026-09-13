@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,7 +113,34 @@ func (f *fakeZulipServer) reactionLog() []string {
 	return append([]string(nil), f.reactions...)
 }
 
+// lockedBuf is a slog sink the wiring test can read while the service is still
+// logging from its own goroutines.
+type lockedBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestRunEndToEnd(t *testing.T) {
+	// At INFO — what production runs at — the log has to tell an operator what
+	// the bot did. A run that shows nothing between the queue registration and
+	// the webhook is exactly the outage this asserts against.
+	var logs lockedBuf
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(prev)
+
 	zulip, zulipURL := newFakeZulipServer(t)
 
 	// The downstream receiver: it verifies the signature exactly as the real one
@@ -272,5 +301,24 @@ func TestRunEndToEnd(t *testing.T) {
 	}
 	if _, err := http.Get(base + "/health"); err == nil {
 		t.Error("the HTTP server is still listening after shutdown")
+	}
+
+	// The operator-visible lifecycle, in order. "msg=recorder" is the fake
+	// recorder's "fake recorder: joined" stderr line, promoted out of Debug.
+	out := logs.String()
+	for pos, want := 0, []string{
+		`msg="call link detected"`,
+		`msg="recording requested"`,
+		`msg="recording started"`,
+		`msg=recorder job=`,
+		`msg="recorder finished"`,
+		`msg="job finished"`,
+		`msg="webhook sent"`,
+	}; len(want) > 0; want = want[1:] {
+		i := strings.Index(out[pos:], want[0])
+		if i < 0 {
+			t.Fatalf("INFO log has no %s after offset %d; log:\n%s", want[0], pos, out)
+		}
+		pos += i + len(want[0])
 	}
 }

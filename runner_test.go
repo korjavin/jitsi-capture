@@ -804,3 +804,48 @@ func TestParseResult(t *testing.T) {
 		})
 	}
 }
+
+// The recorder's stderr carries the join/lobby/record/stop timeline and the
+// per-participant capture one. Those lines are the only trace an operator at
+// INFO has of what happened inside the call, so the classifier that picks them
+// out of the rest of the chatter is worth pinning down.
+func TestIsMilestone(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want bool
+	}{
+		{"2026-09-13T10:00:00.000Z joining room standup as NoteTaker", true},
+		{"2026-09-13T10:00:02.000Z state: waiting_in_lobby", true},
+		{"2026-09-13T10:00:05.000Z state: joined", true},
+		{"2026-09-13T10:00:05.100Z conference mode: jvb", true},
+		{"2026-09-13T10:00:06.000Z remote audio tracks: 1", true},
+		{"2026-09-13T10:00:06.100Z track attached abc123 name=Alice muted=true", true},
+		{"2026-09-13T10:01:00.000Z track detached abc123 reason=left", true},
+		{"2026-09-13T10:02:00.000Z stopping: empty_room", true},
+		{"2026-09-13T10:02:01.000Z wrote 4096 bytes in 61.0s, 1 participant(s)", true},
+		{"2026-09-13T10:00:03.000Z state: waiting", false},
+		{"2026-09-13T10:00:04.000Z state probe failed: <url>", false},
+		{"2026-09-13T10:01:30.000Z track write failed: ENOSPC", false},
+		{"2026-09-13T10:02:02.000Z per-participant tracks: 1 in /data/tracks", false},
+	} {
+		if got := isMilestone(tc.line); got != tc.want {
+			t.Errorf("isMilestone(%q) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
+
+// roomName is what keeps a JWT or a room password out of the logs.
+func TestRoomName(t *testing.T) {
+	for _, tc := range [][2]string{
+		{"https://meet.example.invalid/RoomE2E", "RoomE2E"},
+		{"https://meet.example.invalid/RoomE2E/", "RoomE2E"},
+		{"https://meet.example.invalid/RoomE2E?jwt=secret", "RoomE2E"},
+		{"https://meet.example.invalid/RoomE2E#config.x=1", "RoomE2E"},
+		{"https://meet.example.invalid/", "(root)"},
+		{"", "(root)"},
+	} {
+		if got := roomName(tc[0]); got != tc[1] {
+			t.Errorf("roomName(%q) = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+}
