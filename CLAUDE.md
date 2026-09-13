@@ -61,30 +61,43 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 ## Build & Test
 
 ```bash
-# Python (transcriber) — run from the repo root
-pip install -r transcriber/requirements.txt -r transcriber/requirements-dev.txt
-ruff check .
-pytest -q
+# Go (the service) — run from the repo root
+gofmt -l . && go vet ./... && go test -race ./...
 
 # Node (recorder) — PUPPETEER_SKIP_DOWNLOAD=1 avoids a ~150MB Chrome download
 cd recorder && PUPPETEER_SKIP_DOWNLOAD=1 npm ci && npm test
 
-# Docker — one image with Node + Chromium + Python
-docker build -t jitsi2outline .
+# Docker — one image with the Go binary + Node + Chromium
+docker build -t jitsi-capture .
 ```
 
-CI (`.github/workflows/ci.yml`) runs these same three jobs (`python` / `node` /
+CI (`.github/workflows/ci.yml`) runs these same three jobs (`go` / `node` /
 `docker`) on every pull request and on pushes to `master`. Unit tests must pass
-offline: no network, no Jitsi, no Whisper model download, no Outline, no Zulip.
+offline: no network, no Jitsi, no Zulip. Use `net/http/httptest` for HTTP
+boundaries and a fake recorder shell script for the subprocess.
 
 ## Architecture Overview
 
-One Docker image holds everything: the Python Zulip bot launches
-`recorder/record.js` (Node + Puppeteer + Chromium) as a **subprocess**, then
-transcribes the audio with faster-whisper and publishes to Outline.
+`jitsi-capture` is the first of three services:
 
-- `recorder/record.js` — joins a Jitsi meeting headless, writes `audio.wav`.
-- `transcriber/` — faster-whisper transcription, Outline client, Zulip bot, pipeline.
+```
+Zulip 🎙️ reaction -> jitsi-capture records the Jitsi call -> audio under DATA_DIR
+  -> signed `recording.finished` webhook -> transcribetor (CPU transcription)
+  -> Anarlog-format webhook -> tr2outline (Outline publisher)
+  -> callback POST /notify on jitsi-capture -> "transcript ready" in the Zulip topic
+```
+
+This repo does ONLY: the Zulip bot (reaction flow), running the Node recorder as
+a child process, persisting job state + audio on disk, sending the webhook, and
+serving `/notify` + `/health`. No transcription and no Outline here.
+
+- Go `package main` at the repo root, flat files (`config.go`, `job.go`, …),
+  stdlib only — no new dependencies.
+- `recorder/record.js` — Node + Puppeteer + Chromium, joins a Jitsi meeting
+  headless and writes the audio; the Go service runs it as a child process and
+  reads the single final JSON line from its stdout.
+- Configuration is env-only (`config.go` is the single reader of `os.Getenv`).
+  Never log secrets — log the variable NAME, not the value.
 
 See `README.md` for the full spec.
 
