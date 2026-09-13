@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -60,12 +61,26 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	// and exit 0, so the job that shutdown produces is precisely the one worth
 	// delivering. sendWebhook's backoff table bounds the attempt.
 	hookCtx := context.WithoutCancel(ctx)
-	onFinished := func(job Job) {
+	deliver := func(job Job) {
 		if err := sendWebhook(hookCtx, cfg, job); err != nil {
 			slog.Warn("webhook not delivered, will retry after the next sweep", "job", job.ID, "err", err)
 			return
 		}
 		stampDelivered(cfg, job)
+	}
+	// Recovery deliveries go to the background, everything after that is
+	// synchronous: Stop's grace exists so a recording finalized by SIGTERM can
+	// still reach the receiver before the process leaves.
+	// ponytail: a background delivery dies with the process — the job stays
+	// unstamped and the next sweep or restart picks it up again.
+	var detached atomic.Bool
+	detached.Store(true)
+	onFinished := func(job Job) {
+		if detached.Load() {
+			go deliver(job)
+			return
+		}
+		deliver(job)
 	}
 
 	runner := newRunner(cfg, z, onFinished)
@@ -90,16 +105,16 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		}
 	}()
 
+	// Behind the listener so a health probe answers while recovery runs, but in
+	// front of the bot: repairing the jobs a restart interrupted has to finish
+	// before a click can start a new one, or Resume would mistake that new
+	// recording for a leftover. Only the webhook resends it triggers detach.
+	runner.Resume(ctx)
+	detached.Store(false)
+
 	tick := time.NewTicker(sweepEvery)
 	defer tick.Stop()
 	go func() {
-		// Resume runs behind the listener, not in front of it: one unsent webhook
-		// to a receiver that is down costs the whole backoff table, and a health
-		// probe that hangs for minutes gets the container killed instead of
-		// recovered. ponytail: a 🎙️ click landing in that window reads a stale
-		// "recording" and is a silent no-op — the next click works. Split Resume
-		// into repair + resend if that ever matters.
-		runner.Resume(ctx)
 		for {
 			select {
 			case <-ctx.Done():
