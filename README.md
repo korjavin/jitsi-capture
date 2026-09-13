@@ -251,7 +251,9 @@ docker compose logs -f
 
 With **Portainer**, deploy as a git-ops stack: point a stack at this repository,
 let Portainer build the image, and set the same variables in the stack's
-environment. The parts that matter:
+environment — no `.env` file is needed there, `docker-compose.yml` passes every
+variable through from whatever environment Compose runs in. The parts that
+matter:
 
 * **`HOST_DATA_DIR` bind mount** — job state and audio must survive a redeploy.
   Create the directory on the host first (`mkdir -p /srv/jitsi-capture/data`).
