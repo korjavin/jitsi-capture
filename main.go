@@ -65,15 +65,10 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 			slog.Warn("webhook not delivered, will retry after the next sweep", "job", job.ID, "err", err)
 			return
 		}
-		now := time.Now()
-		job.WebhookSentAt = &now
-		if err := job.save(cfg.DataDir); err != nil {
-			slog.Error("saving job", "job", job.ID, "err", err)
-		}
+		stampDelivered(cfg, job)
 	}
 
 	runner := newRunner(cfg, z, onFinished)
-	runner.Resume(ctx)
 	sweepRetention(cfg.DataDir, cfg.AudioRetentionDays)
 
 	srv := newHTTPServer(cfg.ListenAddr, (&server{
@@ -98,6 +93,13 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	tick := time.NewTicker(sweepEvery)
 	defer tick.Stop()
 	go func() {
+		// Resume runs behind the listener, not in front of it: one unsent webhook
+		// to a receiver that is down costs the whole backoff table, and a health
+		// probe that hangs for minutes gets the container killed instead of
+		// recovered. ponytail: a 🎙️ click landing in that window reads a stale
+		// "recording" and is a silent no-op — the next click works. Split Resume
+		// into repair + resend if that ever matters.
+		runner.Resume(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -118,6 +120,26 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	}
 	runner.Stop(recorderGrace)
 	return runErr
+}
+
+// stampDelivered records the delivery in job.json — but re-reads first, because
+// delivery can retry for minutes and a second 🎙️ click re-records into the same
+// directory meanwhile. Writing the stale copy back would resurrect "finished"
+// over a live recording. StartedAt is the generation marker: Start stamps it
+// afresh every time.
+// ponytail: a Start landing between the read and the save still wins the
+// clobber; put the stamp behind the runner's mutex if that ever bites.
+func stampDelivered(cfg Config, job Job) {
+	cur, err := loadJob(cfg.DataDir, job.ID)
+	if err != nil || cur.State != JobFinished || !cur.StartedAt.Equal(job.StartedAt) {
+		slog.Info("webhook delivered for a superseded job", "job", job.ID)
+		return
+	}
+	now := time.Now()
+	cur.WebhookSentAt = &now
+	if err := cur.save(cfg.DataDir); err != nil {
+		slog.Error("saving job", "job", job.ID, "err", err)
+	}
 }
 
 // resendUnsent hands every finished job whose webhook never went out back to the

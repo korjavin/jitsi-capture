@@ -186,6 +186,10 @@ func (r *Runner) settle(job Job) {
 	// see the final state on disk. The other order lets Start read "recording",
 	// return ErrDuplicateJob, and leave the bot's 🔴 re-add landing after the
 	// removal — a red dot stuck on a message whose job is already over.
+	// ponytail: a click can still slip between the save and the removal, and
+	// lose the new recording's 🔴 to this removal; that one clears itself when
+	// the new job ends. Closing it for good means holding the runner's mutex
+	// across settlement and admission.
 	if err := job.save(r.cfg.DataDir); err != nil {
 		slog.Error("saving job", "job", job.ID, "err", err)
 	}
