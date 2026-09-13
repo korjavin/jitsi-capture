@@ -193,11 +193,11 @@ func (r *Runner) run(job Job, rec *recording) {
 // settle posts the failure note if any, persists the job, drops the recording
 // reaction and hands a finished job to the webhook sender.
 func (r *Runner) settle(job Job) {
-	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
-	defer cancel()
-
 	if job.State == JobFailed {
-		r.note(ctx, job) // outside the lock: a note races nothing
+		// Outside the lock: a note races nothing.
+		ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
+		r.note(ctx, job)
+		cancel()
 	}
 	// The save and the removal go under the same mutex Start holds across its
 	// duplicate check, its save and its own 🔴. A 🎙️ click racing this either
@@ -209,7 +209,11 @@ func (r *Runner) settle(job Job) {
 	if err := job.save(r.cfg.DataDir); err != nil {
 		slog.Error("saving job", "job", job.ID, "err", err)
 	}
+	// The timeout starts here, not before the lock: waiting for an admission to
+	// finish must not spend the removal's budget.
+	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
 	r.clearReaction(ctx, job)
+	cancel()
 	r.mu.Unlock()
 
 	// Outside the lock: delivery retries for minutes, and stampDelivered takes
@@ -230,9 +234,9 @@ func (r *Runner) note(ctx context.Context, job Job) {
 }
 
 // markRecording puts the recording indicator on the job's message. Failing to
-// add it is logged, never fatal: the recording itself is what matters, and a
-// second click on a job already recording is expected to be rejected by Zulip.
-// Must be called with r.mu held.
+// add it is logged, never fatal: the recording itself is what matters. Must be
+// called with r.mu held, and it takes its own timeout so a wait for that lock
+// cannot eat into this call's budget.
 func (r *Runner) markRecording(job Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
 	defer cancel()
