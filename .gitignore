@@ -1,7 +1,5 @@
 # Git ignore
 node_modules/
-__pycache__/
-*.pyc
 .env
 data/
 *.wav
@@ -9,6 +7,9 @@ data/
 *.ogg
 *.webm
 .DS_Store
+
+# Compiled Go binary
+/jitsi-capture
 
 # Beads / Dolt files (added by bd init)
 .dolt/
