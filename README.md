@@ -244,7 +244,7 @@ the whole deployment.
 ### Run it locally
 
 ```bash
-cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR, DOMAIN
+cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, DOMAIN
 # compose has no `build:`, so build the image under the tag it references
 docker build -t ghcr.io/korjavin/jitsi-capture:latest .
 docker compose up -d
@@ -285,8 +285,8 @@ Set these in the stack:
 | `JITSI_BASE_URL` | required |
 | `WEBHOOK_URL`, `WEBHOOK_SECRET` | transcriber endpoint + shared secret |
 | `PUBLIC_URL` | how the transcriber reaches this service (`callback_url` prefix) |
-| `HOST_DATA_DIR` | **host path on the Portainer node** for the bind mount |
 | `DATA_DIR` | container path (default `/data`) |
+| `HOST_DATA_DIR` | leave **unset** — see the named volume below |
 | `DOMAIN` | public hostname Traefik routes to this service |
 | `TRAEFIK_NETWORK_NAME` | existing external Traefik network (default `traefik`) |
 | `TRAEFIK_CERTRESOLVER` | Traefik ACME resolver (default `myresolver`) |
@@ -294,9 +294,13 @@ Set these in the stack:
 
 The parts that matter:
 
-* **`HOST_DATA_DIR` bind mount** — job state and audio must survive a redeploy.
-  It is a path on the Portainer node, not in this repository; create it there
-  first (`mkdir -p /srv/jitsi-capture/data`).
+* **The `jitsi-capture-data` named volume** — job state and audio live there and
+  survive a redeploy. It is declared with a fixed name, so the transcriber stack
+  mounts the very same volume as `external: true` at the same path; that is why
+  `HOST_DATA_DIR` stays unset (the service then defaults it to `DATA_DIR` and
+  the `audio_path` in the webhook needs no translation). Only set
+  `HOST_DATA_DIR` if the receiving service sees the recordings under a
+  different path.
 * **`shm_size: 1g`** — Chromium crashes on longer calls with Docker's 64 MB
   default `/dev/shm`.
 * **`stop_grace_period: 120s`** — lets an in-flight recording finalize its file
@@ -312,7 +316,9 @@ The parts that matter:
 3. Click it → a 🔴 reaction appears.
 4. **Admit `NoteTaker`** from the Jitsi lobby (a human has to do this).
 5. Talk for more than 15 seconds, then everyone leaves the call.
-6. `HOST_DATA_DIR/jobs/<message-id>/job.json` shows `"state": "finished"` with a
+6. `DATA_DIR/jobs/<message-id>/job.json` in the `jitsi-capture-data` volume
+   (`docker compose exec jitsi-capture cat /data/jobs/<message-id>/job.json`)
+   shows `"state": "finished"` with a
    non-zero `duration_s`, next to `audio.webm`; the receiver logs the
    `recording.finished` webhook. The 🔴 reaction is gone.
 

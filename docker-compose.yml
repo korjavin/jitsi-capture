@@ -29,10 +29,12 @@ services:
       - PUBLIC_URL
       - LOG_LEVEL
     volumes:
-      # Job state (jobs/<id>/job.json) and audio survive a redeploy. Both sides
-      # follow the variables so HOST_DATA_DIR stays the host path the webhook
-      # advertises and the mount always lands on DATA_DIR.
-      - ${HOST_DATA_DIR:-./data}:${DATA_DIR:-/data}
+      # Job state (jobs/<id>/job.json) and audio survive a redeploy. A named
+      # volume, not a host bind: the transcriber stack mounts the very same
+      # volume (as `external: true`) at the same path, so the audio_path in the
+      # webhook resolves there without translation. Leave HOST_DATA_DIR unset —
+      # config.go then defaults it to DATA_DIR, which is what that requires.
+      - jitsi-capture-data:${DATA_DIR:-/data}
     # No ports: mapping — Traefik fronts POST /notify and GET /health over the
     # shared network below.
     networks:
@@ -70,6 +72,12 @@ services:
     # ponytail: no healthcheck — the runtime image ships neither curl nor wget,
     # and adding one just to probe GET /health is not worth the layer. Add it
     # the day the image needs a real HTTP client anyway.
+
+volumes:
+  # Fixed name, not the Compose-project-prefixed default, so the transcriber
+  # stack can mount it as `external: true` under exactly this name.
+  jitsi-capture-data:
+    name: jitsi-capture-data
 
 networks:
   traefik:

@@ -1,6 +1,9 @@
 # Git ignore
 node_modules/
 .env
+# Zulip credentials files — never commit these.
+zuliprc
+*.zuliprc
 data/
 *.wav
 *.mp3
