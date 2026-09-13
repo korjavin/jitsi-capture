@@ -41,7 +41,7 @@ name is logged, never the full URL — it may carry a JWT or a password.
 | 2 | bad arguments (usage on stderr) |
 | 3 | never got into the conference within `--join-timeout` (incl. never admitted from the lobby), or stopped by a signal before joining |
 | 4 | browser launch / page failure |
-| 5 | finished, but the output file is missing or empty |
+| 5 | the recording did not complete: output file missing/empty, a write error, or the audio capture died mid-call (truncated file) |
 
 ### Signals
 

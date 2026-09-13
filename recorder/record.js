@@ -241,13 +241,22 @@ async function main(argv) {
     file.on('error', (e) => {
       fileError = e;
     });
+    // The capture stream only ends on its own if the extension's MediaRecorder
+    // died — we end it deliberately after the loop, so an end during the loop
+    // means the rest of the call was never recorded.
+    let captureDied = false;
+    const onCaptureEnd = () => {
+      captureDied = true;
+    };
+    stream.once('end', onCaptureEnd);
+    stream.once('close', onCaptureEnd);
     stream.pipe(file);
     const startedAt = Date.now();
     log(`recording -> ${opts.out}`);
 
     let aloneSince = null;
     const participants = new Set(); // insertion order == first-seen order
-    while (!reason && !fileError) {
+    while (!reason && !fileError && !captureDied) {
       await sleep(POLL_MS);
       let membersCount = 0; // page gone == nobody left to record
       try {
@@ -270,7 +279,12 @@ async function main(argv) {
     }
 
     const durationS = (Date.now() - startedAt) / 1000;
-    log(`stopping: ${fileError ? 'write error' : reason}`);
+    const failure = fileError
+      ? `output write failed: ${scrub(fileError.message)}`
+      : captureDied
+        ? 'audio capture ended before the call did — the recording is truncated'
+        : null;
+    log(`stopping: ${failure ? 'failed' : reason}`);
     await stream.stop().catch(() => {});
     const flushed = () => Promise.race([once(file, 'finish').catch(() => {}), sleep(FLUSH_MS)]);
     if (!fileError) {
@@ -282,8 +296,8 @@ async function main(argv) {
         await flushed();
       }
     }
-    if (fileError) {
-      log(`output write failed: ${scrub(fileError.message)}`);
+    if (failure) {
+      log(failure);
       return 5;
     }
 
