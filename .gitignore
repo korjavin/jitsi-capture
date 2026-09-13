@@ -1,0 +1,11 @@
+# Git ignore
+node_modules/
+__pycache__/
+*.pyc
+.env
+data/
+*.wav
+*.mp3
+*.ogg
+*.webm
+.DS_Store
