@@ -52,7 +52,7 @@ exits immediately.
 ## Output format
 
 WebM/Opus (48 kHz stereo) exactly as Chrome's `MediaRecorder` produces it — no
-ffmpeg, no WAV conversion. faster-whisper decodes it through PyAV directly.
+ffmpeg, no WAV conversion — the downstream transcriber decodes WebM/Opus itself.
 `ffprobe` reports `Duration: N/A` on these files (a live MediaRecorder stream
 has no seek cues); that is normal and decoders still read every frame. Use the
 `duration_s` field from the JSON line.
