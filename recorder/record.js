@@ -531,7 +531,6 @@ async function main(argv) {
         ? 'audio capture ended before the call did — the recording is truncated'
         : null;
     log(`stopping: ${failure ? 'failed' : reason}`);
-    const trackList = trackCap ? await trackCap.finish() : null;
     await stream.stop().catch(() => {});
     const flushed = () => Promise.race([once(file, 'finish').catch(() => {}), sleep(FLUSH_MS)]);
     if (!fileError) {
@@ -547,6 +546,10 @@ async function main(argv) {
       log(failure);
       return 5;
     }
+
+    // After the mixed stream is finalized, so per-participant capture cannot
+    // stretch audio.webm past the duration_s we are about to report.
+    const trackList = trackCap ? await trackCap.finish() : null;
 
     const size = fs.statSync(opts.out, { throwIfNoEntry: false })?.size ?? 0;
     if (size === 0) {
