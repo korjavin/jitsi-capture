@@ -21,7 +21,7 @@ type Zulip struct {
 	http             *http.Client
 }
 
-// The runner only needs two of these methods; keep the shapes in sync.
+// The runner only needs three of these methods; keep the shapes in sync.
 var _ zulipAPI = (*Zulip)(nil)
 
 // micEmoji is the reaction the bot offers on a call message; clicking it starts

@@ -31,17 +31,23 @@ type Runner struct {
 	cfg        Config
 	z          zulipAPI
 	onFinished func(Job) // set by the integration wiring; sends the webhook
+	// ctx bounds the Zulip calls the runner makes on its own goroutines. It
+	// deliberately outlives SIGTERM — a recording finalized by the signal still
+	// has to post its note and drop its 🔴 — and is cancelled once the service
+	// is done waiting for them.
+	ctx context.Context
 
-	// mu covers the job-state transitions and the recording indicator together:
-	// admission (Start) and settlement each save job.json and change the 🔴 under
-	// it, so a 🎙️ click can never end up with a live recording and no indicator,
-	// nor with an indicator left on a job that is already over.
-	// ponytail: that puts two Zulip calls inside the lock, so a slow Zulip can
-	// delay another Start — or Stop — by up to zulipTimeout. Per-message locks
-	// if that ever shows up.
+	// mu covers the job-state transitions and nothing else: Start's
+	// check-and-save, settle's final save and stampDelivered's
+	// read-modify-write. They are the transitions that would otherwise clobber
+	// each other on disk. No network call is ever made under it, so a slow
+	// Zulip can delay neither a transition nor a shutdown.
 	mu       sync.Mutex
 	stopping bool
 	running  map[string]*recording
+
+	// indMu serializes the recording-indicator calls; see syncIndicator.
+	indMu sync.Mutex
 }
 
 // recording tracks one accepted job from Start until its final state is on
@@ -83,22 +89,40 @@ const (
 	zulipTimeout    = 15 * time.Second // budget for the reaction/message calls
 )
 
-func newRunner(cfg Config, z zulipAPI, onFinished func(Job)) *Runner {
-	return &Runner{cfg: cfg, z: z, onFinished: onFinished, running: map[string]*recording{}}
+func newRunner(ctx context.Context, cfg Config, z zulipAPI, onFinished func(Job)) *Runner {
+	return &Runner{ctx: ctx, cfg: cfg, z: z, onFinished: onFinished, running: map[string]*recording{}}
 }
 
-// Start records the job as recording, puts the recording indicator on its
-// message and spawns the recorder. It returns ErrDuplicateJob when a recording
-// for the same message is already in flight; a previously failed or finished
-// job may be re-recorded, reusing its directory.
-func (r *Runner) Start(job Job) error {
+// Start records the job as recording and spawns the recorder, whose goroutine
+// puts the recording indicator on the message before it joins. It returns
+// ErrDuplicateJob when a recording for the same message is already in flight —
+// re-asserting the indicator on the way out, so a click after an add that
+// failed transiently still produces one. A previously failed or finished job
+// may be re-recorded, reusing its directory.
+//
+// ctx bounds the Zulip call Start itself may make; it is the event loop's, so
+// shutdown cuts it short instead of stalling the loop.
+func (r *Runner) Start(ctx context.Context, job Job) error {
+	rec, err := r.admit(&job)
+	if err != nil {
+		if errors.Is(err, ErrDuplicateJob) {
+			r.syncIndicator(ctx, job)
+		}
+		return err
+	}
+	go r.run(job, rec)
+	return nil
+}
+
+// admit is Start's critical section: the duplicate check and the first save,
+// atomic against every other job-state transition. It makes no network call, so
+// nothing waiting on r.mu ever waits on Zulip.
+func (r *Runner) admit(job *Job) (*recording, error) {
 	r.mu.Lock()
-	// Held across check+save+🔴: two Starts cannot both win, and a settlement
-	// dropping the previous recording's 🔴 cannot interleave with this one.
 	defer r.mu.Unlock()
 
 	if old, err := loadJob(r.cfg.DataDir, job.ID); err == nil && old.State == JobRecording {
-		return ErrDuplicateJob
+		return nil, ErrDuplicateJob
 	}
 	job.State = JobRecording
 	job.Error = ""
@@ -108,16 +132,12 @@ func (r *Runner) Start(job Job) error {
 	job.WebhookSentAt = nil
 	job.AudioPath = filepath.Join(jobDir(r.cfg.DataDir, job.ID), "audio.webm")
 	if err := job.save(r.cfg.DataDir); err != nil {
-		return err
+		return nil, err
 	}
-	// The indicator goes on before the recorder is spawned, so a child that dies
-	// immediately still finds it there to clear.
-	r.markRecording(job)
 	// Registered here, not in run: Stop must see a job it just accepted.
 	rec := &recording{done: make(chan struct{})}
 	r.running[job.ID] = rec
-	go r.run(job, rec)
-	return nil
+	return rec, nil
 }
 
 // run drives one recorder child process to completion and settles the job.
@@ -130,6 +150,12 @@ func (r *Runner) run(job Job, rec *recording) {
 		r.mu.Unlock()
 		close(rec.done)
 	}()
+
+	// The indicator goes on here rather than in Start because it is a network
+	// call: the event loop must not wait for Zulip, while this goroutine is
+	// already covered by Stop's grace through rec.done. It is still on before
+	// the child spawns, so a recorder that dies at once finds it there to clear.
+	r.syncIndicator(r.ctx, job)
 
 	cmd := exec.Command(nodeBin, r.cfg.RecorderPath,
 		"--url", job.JitsiURL,
@@ -190,64 +216,83 @@ func (r *Runner) run(job Job, rec *recording) {
 	r.settle(job)
 }
 
-// settle posts the failure note if any, persists the job, drops the recording
-// reaction and hands a finished job to the webhook sender.
+// settle persists the job, posts the failure note if any, brings the recording
+// indicator in line with the new state and hands a finished job to the webhook
+// sender.
 func (r *Runner) settle(job Job) {
-	if job.State == JobFailed {
-		// Outside the lock: a note races nothing.
-		ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
-		r.note(ctx, job)
-		cancel()
-	}
-	// The save and the removal go under the same mutex Start holds across its
-	// duplicate check, its save and its own 🔴. A 🎙️ click racing this either
-	// arrives first and reads "recording" (ErrDuplicateJob, a no-op), or waits
-	// and admits a new recording whose 🔴 goes on after this removal — never
-	// before it, which is what used to strand a live recording without one.
-	// Saving first also keeps the on-disk state final while the 🔴 comes off.
+	// The final state reaches disk before any network call: Stop is waiting for
+	// exactly this file, and a click racing the settlement has to be able to
+	// read it. The save shares Start's mutex because a settlement landing after
+	// a re-record's admission would otherwise resurrect "finished" over a live
+	// recording.
 	r.mu.Lock()
-	if err := job.save(r.cfg.DataDir); err != nil {
+	err := job.save(r.cfg.DataDir)
+	r.mu.Unlock()
+	if err != nil {
 		slog.Error("saving job", "job", job.ID, "err", err)
 	}
-	// The timeout starts here, not before the lock: waiting for an admission to
-	// finish must not spend the removal's budget.
-	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
-	r.clearReaction(ctx, job)
-	cancel()
-	r.mu.Unlock()
 
-	// Outside the lock: delivery retries for minutes, and stampDelivered takes
-	// the same mutex.
+	// After the save, never before: whoever reads the note and clicks again
+	// must find a job that is no longer recording, not a silent no-op.
+	if job.State == JobFailed {
+		r.note(job)
+	}
+	r.syncIndicator(r.ctx, job)
+
 	if job.State == JobFinished && r.onFinished != nil {
 		r.onFinished(job)
 	}
 }
 
-func (r *Runner) note(ctx context.Context, job Job) {
+func (r *Runner) note(job Job) {
 	text, ok := failNote[job.Error]
 	if !ok {
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.ctx, zulipTimeout)
+	defer cancel()
 	if err := r.z.SendMessage(ctx, job.Stream, job.Topic, text); err != nil {
 		slog.Error("posting failure note", "job", job.ID, "err", err)
 	}
 }
 
-// markRecording puts the recording indicator on the job's message. Failing to
-// add it is logged, never fatal: the recording itself is what matters. Must be
-// called with r.mu held, and it takes its own timeout so a wait for that lock
-// cannot eat into this call's budget.
-func (r *Runner) markRecording(job Job) {
-	ctx, cancel := context.WithTimeout(context.Background(), zulipTimeout)
-	defer cancel()
-	if err := r.z.AddReaction(ctx, job.MessageID, recordingEmoji); err != nil {
-		slog.Error("adding the recording reaction", "job", job.ID, "err", err)
-	}
-}
+// syncIndicator makes the recording indicator on the job's message match the
+// job state on disk — the same file Start's duplicate check reads.
+//
+// Reading that state back, instead of carrying "add" or "remove" down from the
+// caller, is what makes concurrent updates safe without holding r.mu across the
+// network: indMu serializes the calls, so whichever one runs last read a state
+// at least as fresh as every save before it, and leaves the message matching
+// that state. A click racing a settlement therefore cannot lose its indicator
+// to the removal, and a settlement with no click behind it cannot strand one.
+// The price is an occasional redundant call inside that window, which Zulip
+// rejects harmlessly.
+//
+// ponytail: one lock for every message, so a hung Zulip delays the next
+// message's indicator by up to zulipTimeout — never a state transition, never a
+// shutdown. Per-message locks if a deployment ever records many calls at once.
+func (r *Runner) syncIndicator(ctx context.Context, job Job) {
+	r.indMu.Lock()
+	defer r.indMu.Unlock()
 
-func (r *Runner) clearReaction(ctx context.Context, job Job) {
+	cur, err := loadJob(r.cfg.DataDir, job.ID)
+	if err != nil {
+		slog.Error("reading job state for the recording indicator", "job", job.ID, "err", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, zulipTimeout)
+	defer cancel()
+
+	// Warn, not Error: the indicator is cosmetic, and the redundant call a
+	// racing click produces comes back from Zulip as a failure.
+	if cur.State == JobRecording {
+		if err := r.z.AddReaction(ctx, job.MessageID, recordingEmoji); err != nil {
+			slog.Warn("adding the recording reaction", "job", job.ID, "err", err)
+		}
+		return
+	}
 	if err := r.z.RemoveReaction(ctx, job.MessageID, recordingEmoji); err != nil {
-		slog.Error("removing reaction", "job", job.ID, "err", err)
+		slog.Warn("removing the recording reaction", "job", job.ID, "err", err)
 	}
 }
 
@@ -321,7 +366,7 @@ func signalProcess(id string, cmd *exec.Cmd, sig os.Signal) {
 // Resume repairs state left behind by a restart: a recording cannot survive the
 // container (the browser died with it), so it is marked interrupted; a finished
 // job whose webhook never went out is handed back to the sender.
-func (r *Runner) Resume(ctx context.Context) {
+func (r *Runner) Resume() {
 	jobs, err := listJobs(r.cfg.DataDir)
 	if err != nil {
 		slog.Error("listing jobs on resume", "err", err)
@@ -335,17 +380,36 @@ func (r *Runner) Resume(ctx context.Context) {
 			job.Error = errInterrupted
 			job.EndedAt = &now
 			slog.Warn("job interrupted by restart", "job", job.ID)
-			r.note(ctx, job)
-			r.clearReaction(ctx, job)
-			if err := job.save(r.cfg.DataDir); err != nil {
-				slog.Error("saving job", "job", job.ID, "err", err)
-			}
+			// The same ending every other failure gets: save, note, indicator.
+			r.settle(job)
 		case job.State == JobFinished && job.WebhookSentAt == nil:
 			slog.Info("retrying webhook after restart", "job", job.ID)
 			if r.onFinished != nil {
 				r.onFinished(job)
 			}
 		}
+	}
+}
+
+// stampDelivered records the delivery in job.json — but re-reads first, because
+// delivery can retry for minutes and a second 🎙️ click re-records into the same
+// directory meanwhile. Writing the stale copy back would resurrect "finished"
+// over a live recording. StartedAt is the generation marker: Start stamps it
+// afresh every time, and the runner's mutex covers the re-read and the write
+// together, so an admission cannot slip between them.
+func (r *Runner) stampDelivered(job Job) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cur, err := loadJob(r.cfg.DataDir, job.ID)
+	if err != nil || cur.State != JobFinished || !cur.StartedAt.Equal(job.StartedAt) {
+		slog.Info("webhook delivered for a superseded job", "job", job.ID)
+		return
+	}
+	now := time.Now()
+	cur.WebhookSentAt = &now
+	if err := cur.save(r.cfg.DataDir); err != nil {
+		slog.Error("saving job", "job", job.ID, "err", err)
 	}
 }
 

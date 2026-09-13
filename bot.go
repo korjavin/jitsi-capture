@@ -21,10 +21,10 @@ type Bot struct {
 	z       *Zulip
 	botID   int64
 	jitsiRe *regexp.Regexp
-	start   func(Job) error // the runner's Start; a plain func value is the seam
+	start   func(context.Context, Job) error // the runner's Start; a plain func value is the seam
 }
 
-func newBot(cfg Config, z *Zulip, start func(Job) error) *Bot {
+func newBot(cfg Config, z *Zulip, start func(context.Context, Job) error) *Bot {
 	return &Bot{
 		z:     z,
 		start: start,
@@ -133,11 +133,11 @@ func (b *Bot) startJob(ctx context.Context, msgID int64) {
 		Topic:     m.Subject,
 		JitsiURL:  roomURL,
 	}
-	// The "recording now" indicator belongs to the runner, which puts it on and
-	// takes it off under the same mutex as the job-state transitions. A second
-	// click on a live recording is a silent no-op: that job still owns the
-	// indicator.
-	if err := b.start(job); err != nil && !errors.Is(err, ErrDuplicateJob) {
+	// The "recording now" indicator belongs to the runner, which keeps it in
+	// step with the job state on disk. A second click on a live recording is a
+	// silent no-op for the user: that job still owns the indicator, and the
+	// runner re-asserts it in case the first add never landed.
+	if err := b.start(ctx, job); err != nil && !errors.Is(err, ErrDuplicateJob) {
 		slog.Error("starting the recording failed", "job", job.ID, "err", err)
 	}
 }

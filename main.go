@@ -61,6 +61,11 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	// and exit 0, so the job that shutdown produces is precisely the one worth
 	// delivering. sendWebhook's backoff table bounds the attempt.
 	hookCtx := context.WithoutCancel(ctx)
+	// The runner's Zulip calls outlive ctx for the same reason: a recording that
+	// SIGTERM finalized still has to post its note and drop its 🔴. Cancelled
+	// when run returns, so nothing is left hanging on a dead service.
+	zulipCtx, endZulipCalls := context.WithCancel(context.WithoutCancel(ctx))
+	defer endZulipCalls()
 	// Assigned below; every call reaches deliver through the runner itself.
 	var runner *Runner
 	deliver := func(job Job) {
@@ -85,7 +90,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		deliver(job)
 	}
 
-	runner = newRunner(cfg, z, onFinished)
+	runner = newRunner(zulipCtx, cfg, z, onFinished)
 	sweepRetention(cfg.DataDir, cfg.AudioRetentionDays)
 
 	srv := newHTTPServer(cfg.ListenAddr, (&server{
@@ -111,7 +116,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	// front of the bot: repairing the jobs a restart interrupted has to finish
 	// before a click can start a new one, or Resume would mistake that new
 	// recording for a leftover. Only the webhook resends it triggers detach.
-	runner.Resume(ctx)
+	runner.Resume()
 	detached.Store(false)
 
 	tick := time.NewTicker(sweepEvery)
@@ -137,31 +142,6 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	}
 	runner.Stop(recorderGrace)
 	return runErr
-}
-
-// stampDelivered records the delivery in job.json — but re-reads first, because
-// delivery can retry for minutes and a second 🎙️ click re-records into the same
-// directory meanwhile. Writing the stale copy back would resurrect "finished"
-// over a live recording. StartedAt is the generation marker: Start stamps it
-// afresh every time, and the runner's mutex covers the re-read and the write
-// together, so an admission cannot slip between them.
-//
-// It lives here, next to the webhook wiring that is its only caller, but it is
-// a Runner method because it shares that mutex.
-func (r *Runner) stampDelivered(job Job) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	cur, err := loadJob(r.cfg.DataDir, job.ID)
-	if err != nil || cur.State != JobFinished || !cur.StartedAt.Equal(job.StartedAt) {
-		slog.Info("webhook delivered for a superseded job", "job", job.ID)
-		return
-	}
-	now := time.Now()
-	cur.WebhookSentAt = &now
-	if err := cur.save(r.cfg.DataDir); err != nil {
-		slog.Error("saving job", "job", job.ID, "err", err)
-	}
 }
 
 // resendUnsent hands every finished job whose webhook never went out back to the
