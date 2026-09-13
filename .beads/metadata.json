@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "jitsi2outline",
+  "project_id": "0f985415-dfd0-4610-9b95-96f166182391"
+}
