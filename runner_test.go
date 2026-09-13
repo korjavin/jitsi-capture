@@ -16,12 +16,19 @@ import (
 // later assignment.
 func init() { nodeBin = "sh" }
 
+// zulipCall kinds.
+const (
+	callAdd     = "add"
+	callRemove  = "remove"
+	callMessage = "message"
+)
+
 type zulipCall struct {
+	kind          string
 	msgID         int64
 	emoji         string
 	stream, topic string
 	content       string
-	isRemoveReact bool
 }
 
 type fakeZulip struct {
@@ -32,6 +39,13 @@ type fakeZulip struct {
 	beforeRemove func()        // runs at the start of RemoveReaction
 }
 
+func (f *fakeZulip) AddReaction(_ context.Context, msgID int64, emoji string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, zulipCall{kind: callAdd, msgID: msgID, emoji: emoji})
+	return f.err
+}
+
 func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string) error {
 	if f.beforeRemove != nil {
 		f.beforeRemove()
@@ -39,14 +53,14 @@ func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string)
 	time.Sleep(f.delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, zulipCall{msgID: msgID, emoji: emoji, isRemoveReact: true})
+	f.calls = append(f.calls, zulipCall{kind: callRemove, msgID: msgID, emoji: emoji})
 	return f.err
 }
 
 func (f *fakeZulip) SendMessage(_ context.Context, stream, topic, content string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, zulipCall{stream: stream, topic: topic, content: content})
+	f.calls = append(f.calls, zulipCall{kind: callMessage, stream: stream, topic: topic, content: content})
 	return f.err
 }
 
@@ -59,8 +73,20 @@ func (f *fakeZulip) snapshot() []zulipCall {
 func (f *fakeZulip) messages() []string {
 	var out []string
 	for _, c := range f.snapshot() {
-		if !c.isRemoveReact {
+		if c.kind == callMessage {
 			out = append(out, c.content)
+		}
+	}
+	return out
+}
+
+// indicatorLog is every add/remove of the recording indicator on msgID, in
+// order — the sequence a viewer of the message would have seen.
+func (f *fakeZulip) indicatorLog(msgID int64) []string {
+	var out []string
+	for _, c := range f.snapshot() {
+		if c.kind != callMessage && c.msgID == msgID && c.emoji == recordingEmoji {
+			out = append(out, c.kind)
 		}
 	}
 	return out
@@ -68,7 +94,7 @@ func (f *fakeZulip) messages() []string {
 
 func (f *fakeZulip) reactionRemoved(msgID int64) bool {
 	for _, c := range f.snapshot() {
-		if c.isRemoveReact && c.msgID == msgID && c.emoji == recordingEmoji {
+		if c.kind == callRemove && c.msgID == msgID && c.emoji == recordingEmoji {
 			return true
 		}
 	}
@@ -313,6 +339,89 @@ func TestSettleSavesBeforeClearingReaction(t *testing.T) {
 	}
 	if stateAtRemoval != JobFinished {
 		t.Errorf("job.json said %q while the reaction was removed, want %q", stateAtRemoval, JobFinished)
+	}
+}
+
+// A 🎙️ click landing while a finished job's 🔴 is coming off must not lose the
+// new recording's own 🔴 to that removal. Admission and settlement take the same
+// mutex, so the indicator can only go back on after the removal: the message a
+// viewer sees alternates add/remove, never add/add.
+func TestStartAndSettleSerializeTheIndicator(t *testing.T) {
+	r, z, finished := newTestRunner(t, "rec_ok.sh")
+	job := testJob()
+
+	var once sync.Once
+	reStart := make(chan error, 1)
+	z.beforeRemove = func() {
+		once.Do(func() { // only the first settlement is raced
+			go func() { reStart <- r.Start(testJob()) }()
+			// Long enough for an unserialized Start to save, add its 🔴, and
+			// then lose it to the removal that follows.
+			time.Sleep(100 * time.Millisecond)
+		})
+	}
+
+	if err := r.Start(job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		select {
+		case <-finished:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("recording %d never finished", i)
+		}
+	}
+	if err := <-reStart; err != nil {
+		t.Fatalf("re-record Start: %v", err)
+	}
+
+	want := []string{callAdd, callRemove, callAdd, callRemove}
+	if got := z.indicatorLog(job.MessageID); !reflect.DeepEqual(got, want) {
+		t.Errorf("indicator changes = %v, want %v", got, want)
+	}
+}
+
+// stampDelivered shares the runner's mutex with Start, so a delivery that read
+// job.json before a re-record cannot write it back afterwards.
+func TestStampDeliveredWaitsForTheRunnerMutex(t *testing.T) {
+	r, _, _ := newTestRunner(t, "rec_ok.sh")
+	delivered := testJob()
+	delivered.State = JobFinished
+	delivered.StartedAt = time.Now().Add(-time.Hour)
+	if err := delivered.save(r.cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+
+	r.mu.Lock() // stands in for the Start that is admitting the re-record
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.stampDelivered(delivered)
+	}()
+	select {
+	case <-done:
+		r.mu.Unlock()
+		t.Fatal("stampDelivered ran without the runner mutex: a Start can still land between its read and its save")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// What that Start would have written: the same directory, a new generation.
+	next := testJob()
+	next.State = JobRecording
+	next.StartedAt = time.Now()
+	if err := next.save(r.cfg.DataDir); err != nil {
+		r.mu.Unlock()
+		t.Fatal(err)
+	}
+	r.mu.Unlock()
+	<-done
+
+	got, err := loadJob(r.cfg.DataDir, delivered.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != JobRecording || got.WebhookSentAt != nil {
+		t.Errorf("job.json = %+v, want the re-record untouched", got)
 	}
 }
 

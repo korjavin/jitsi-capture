@@ -133,22 +133,12 @@ func (b *Bot) startJob(ctx context.Context, msgID int64) {
 		Topic:     m.Subject,
 		JitsiURL:  roomURL,
 	}
-	// The "recording now" indicator goes on before the job starts, not after: the
-	// runner clears it when the job ends, and a recorder that dies immediately can
-	// clear it before an add issued afterwards would land — stranding a red dot on
-	// a message whose recording already failed.
-	addErr := b.z.AddReaction(ctx, msgID, recordingEmoji)
-	switch err := b.start(job); {
-	case errors.Is(err, ErrDuplicateJob):
-		// Already recording: the indicator is already there, so addErr is the
-		// expected "reaction already exists". A second click is a silent no-op.
-	case err != nil:
+	// The "recording now" indicator belongs to the runner, which puts it on and
+	// takes it off under the same mutex as the job-state transitions. A second
+	// click on a live recording is a silent no-op: that job still owns the
+	// indicator.
+	if err := b.start(job); err != nil && !errors.Is(err, ErrDuplicateJob) {
 		slog.Error("starting the recording failed", "job", job.ID, "err", err)
-		if err := b.z.RemoveReaction(ctx, msgID, recordingEmoji); err != nil {
-			slog.Error("removing the recording reaction failed", "message_id", msgID, "err", err)
-		}
-	case addErr != nil:
-		slog.Error("adding the recording reaction failed", "message_id", msgID, "err", addErr)
 	}
 }
 

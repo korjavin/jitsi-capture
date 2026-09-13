@@ -121,10 +121,10 @@ func TestBotHandle(t *testing.T) {
 			event: Event{Type: "message", Message: other(msg, func(m *Message) { m.Type = "private" })},
 		},
 		{
-			name:      "a user's microphone reaction starts the job and marks it recording",
-			event:     Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100},
-			wantEmoji: []string{recordingEmoji},
-			wantJobs:  1,
+			// The runner, not the bot, puts the recording indicator on.
+			name:     "a user's microphone reaction starts the job",
+			event:    Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100},
+			wantJobs: 1,
 		},
 		{
 			name:  "the bot's own microphone reaction is ignored",
@@ -171,27 +171,29 @@ func TestBotStartsTheExpectedJob(t *testing.T) {
 	}
 }
 
-// The indicator is added before the job starts, so a start that never took hold
-// has to take it back off again. A duplicate click leaves it alone: the running
-// job still owns it.
-func TestBotStartFailures(t *testing.T) {
+// The recording indicator is the runner's, so a start that never took hold
+// leaves no reaction behind for the bot to take off, and a duplicate click
+// leaves the running job's indicator alone.
+func TestBotStartFailuresTouchNoReactions(t *testing.T) {
 	tests := []struct {
-		name        string
-		err         error
-		wantRemoved []string
+		name string
+		err  error
 	}{
-		{"a duplicate click leaves the running job's indicator alone", ErrDuplicateJob, nil},
-		{"a failed start takes its own indicator back off", errors.New("disk full"), []string{recordingEmoji}},
+		{"a duplicate click", ErrDuplicateJob},
+		{"a failed start", errors.New("disk full")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newBotFixture(t, "https://meet.jit.si", streamMessage(), tc.err)
 			f.bot.handle(context.Background(), Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100})
-			if got := f.reactions(); !reflect.DeepEqual(got, []string{recordingEmoji}) {
-				t.Errorf("reactions = %v; want [%s]", got, recordingEmoji)
+			if got := len(f.startedJobs()); got != 1 {
+				t.Errorf("started %d jobs; want 1", got)
 			}
-			if got := f.removed(); !reflect.DeepEqual(got, tc.wantRemoved) {
-				t.Errorf("removed = %v; want %v", got, tc.wantRemoved)
+			if got := f.reactions(); got != nil {
+				t.Errorf("reactions = %v; want none", got)
+			}
+			if got := f.removed(); got != nil {
+				t.Errorf("removed = %v; want none", got)
 			}
 		})
 	}

@@ -126,7 +126,8 @@ func TestStampDeliveredSkipsSupersededJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stampDelivered(cfg, old)
+	r := newRunner(cfg, nil, nil)
+	r.stampDelivered(old)
 
 	got, err := loadJob(cfg.DataDir, old.ID)
 	if err != nil {
@@ -141,7 +142,7 @@ func TestStampDeliveredSkipsSupersededJob(t *testing.T) {
 	if err := current.save(cfg.DataDir); err != nil {
 		t.Fatal(err)
 	}
-	stampDelivered(cfg, current)
+	r.stampDelivered(current)
 	if got, err = loadJob(cfg.DataDir, current.ID); err != nil || got.WebhookSentAt == nil {
 		t.Errorf("job.json = %+v (%v), want webhook_sent_at", got, err)
 	}
