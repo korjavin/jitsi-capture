@@ -34,7 +34,8 @@ func newBot(cfg Config, z *Zulip, start func(Job) error) *Bot {
 		// would truncate a legitimate name like "team.sync" and silently send the
 		// recorder into a different room. "?" and "#" end it too, so a JWT or a
 		// room password never reaches the job record or the logs.
-		jitsiRe: regexp.MustCompile(regexp.QuoteMeta(cfg.JitsiBaseURL) + "/[^\\s<>()\\[\\]{}\"'`?#|]+"),
+		// A trailing slash on JITSI_BASE_URL would otherwise demand two of them.
+		jitsiRe: regexp.MustCompile(regexp.QuoteMeta(strings.TrimRight(cfg.JitsiBaseURL, "/")) + "/[^\\s<>()\\[\\]{}\"'`?#|]+"),
 	}
 }
 

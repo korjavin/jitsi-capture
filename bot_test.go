@@ -274,6 +274,13 @@ func TestBotHonoursCustomJitsiBaseURL(t *testing.T) {
 		t.Fatalf("jobs = %+v; want one job on %s/fakeroom", jobs, base)
 	}
 
+	// A trailing slash in the configured base must not break matching.
+	slashed := newBotFixture(t, base+"/", msg, nil)
+	slashed.bot.handle(context.Background(), Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100})
+	if jobs := slashed.startedJobs(); len(jobs) != 1 || jobs[0].JitsiURL != base+"/fakeroom" {
+		t.Errorf("jobs = %+v; want one job on %s/fakeroom", jobs, base)
+	}
+
 	foreign := newBotFixture(t, base, msg, nil)
 	foreign.bot.handle(context.Background(), Event{Type: "message", Message: &Message{
 		ID: 101, Type: "stream", Content: testContent, DisplayRecipient: testStream, SenderID: 42,

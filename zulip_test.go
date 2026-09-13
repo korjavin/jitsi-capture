@@ -236,10 +236,22 @@ func TestZulipSendMessage(t *testing.T) {
 	if req.method != http.MethodPost || req.path != "/api/v1/messages" {
 		t.Errorf("got %s %s; want POST /api/v1/messages", req.method, req.path)
 	}
-	for k, want := range map[string]string{"type": "stream", "to": testStream, "topic": testTopic, "content": "hello"} {
+	for k, want := range map[string]string{"type": "stream", "to": `"` + testStream + `"`, "topic": testTopic, "content": "hello"} {
 		if got := req.form.Get(k); got != want {
 			t.Errorf("form %s = %q; want %q", k, got, want)
 		}
+	}
+}
+
+// Zulip reads a bare integer "to" as a channel id, so a stream whose name looks
+// like a number must go over as a JSON string or the message is misrouted.
+func TestZulipSendMessageQuotesNumericStreamNames(t *testing.T) {
+	z, s := newZulipServer(t, func(w http.ResponseWriter, r *http.Request, _ url.Values) { ok(w, "") })
+	if err := z.SendMessage(context.Background(), "2026", testTopic, "hello"); err != nil {
+		t.Fatalf("SendMessage() error: %v", err)
+	}
+	if got := s.requests()[0].form.Get("to"); got != `"2026"` {
+		t.Errorf(`to = %s; want "2026" json-encoded`, got)
 	}
 }
 

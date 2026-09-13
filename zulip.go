@@ -137,9 +137,13 @@ func (z *Zulip) RemoveReaction(ctx context.Context, msgID int64, emojiName strin
 }
 
 func (z *Zulip) SendMessage(ctx context.Context, stream, topic, content string) error {
+	// The recipient goes in JSON-encoded: Zulip reads a bare integer-looking "to"
+	// as a channel id, so a stream named "2026" would otherwise be misrouted.
+	// Marshalling a string cannot fail.
+	to, _ := json.Marshal(stream)
 	return z.do(ctx, http.MethodPost, "/api/v1/messages", nil, url.Values{
 		"type":    {"stream"},
-		"to":      {stream},
+		"to":      {string(to)},
 		"topic":   {topic},
 		"content": {content},
 	}, nil)
