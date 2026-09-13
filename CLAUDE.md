@@ -60,17 +60,33 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+# Python (transcriber) — run from the repo root
+pip install -r transcriber/requirements.txt -r transcriber/requirements-dev.txt
+ruff check .
+pytest -q
+
+# Node (recorder) — PUPPETEER_SKIP_DOWNLOAD=1 avoids a ~150MB Chrome download
+cd recorder && PUPPETEER_SKIP_DOWNLOAD=1 npm ci && npm test
+
+# Docker — one image with Node + Chromium + Python
+docker build -t jitsi2outline .
 ```
+
+CI (`.github/workflows/ci.yml`) runs these same three jobs (`python` / `node` /
+`docker`) on every pull request and on pushes to `master`. Unit tests must pass
+offline: no network, no Jitsi, no Whisper model download, no Outline, no Zulip.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+One Docker image holds everything: the Python Zulip bot launches
+`recorder/record.js` (Node + Puppeteer + Chromium) as a **subprocess**, then
+transcribes the audio with faster-whisper and publishes to Outline.
+
+- `recorder/record.js` — joins a Jitsi meeting headless, writes `audio.wav`.
+- `transcriber/` — faster-whisper transcription, Outline client, Zulip bot, pipeline.
+
+See `README.md` for the full spec.
 
 ## Conventions & Patterns
 
