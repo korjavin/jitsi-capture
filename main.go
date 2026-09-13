@@ -57,16 +57,22 @@ func main() {
 func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	z := newZulip(cfg)
 
-	// The webhook outlives ctx on purpose: SIGTERM makes the recorder finalize
-	// and exit 0, so the job that shutdown produces is precisely the one worth
-	// delivering. sendWebhook's backoff table bounds the attempt.
-	hookCtx := context.WithoutCancel(ctx)
+	// One context for the work that has to outlive ctx: SIGTERM makes the
+	// recorder finalize and exit 0, so the job that shutdown produces is
+	// precisely the one worth delivering — and the settlement producing it still
+	// has to post its note and drop its 🔴. sendWebhook's backoff table bounds
+	// the delivery; cancelling this when run returns bounds the rest, so nothing
+	// is left hanging on a service that is already gone.
+	bg, endBg := context.WithCancel(context.WithoutCancel(ctx))
+	defer endBg()
+	// Assigned below; every call reaches deliver through the runner itself.
+	var runner *Runner
 	deliver := func(job Job) {
-		if err := sendWebhook(hookCtx, cfg, job); err != nil {
+		if err := sendWebhook(bg, cfg, job); err != nil {
 			slog.Warn("webhook not delivered, will retry after the next sweep", "job", job.ID, "err", err)
 			return
 		}
-		stampDelivered(cfg, job)
+		runner.stampDelivered(job)
 	}
 	// Recovery deliveries go to the background, everything after that is
 	// synchronous: Stop's grace exists so a recording finalized by SIGTERM can
@@ -83,7 +89,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		deliver(job)
 	}
 
-	runner := newRunner(cfg, z, onFinished)
+	runner = newRunner(bg, cfg, z, onFinished)
 	sweepRetention(cfg.DataDir, cfg.AudioRetentionDays)
 
 	srv := newHTTPServer(cfg.ListenAddr, (&server{
@@ -109,7 +115,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	// front of the bot: repairing the jobs a restart interrupted has to finish
 	// before a click can start a new one, or Resume would mistake that new
 	// recording for a leftover. Only the webhook resends it triggers detach.
-	runner.Resume(ctx)
+	runner.Resume()
 	detached.Store(false)
 
 	tick := time.NewTicker(sweepEvery)
@@ -135,26 +141,6 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	}
 	runner.Stop(recorderGrace)
 	return runErr
-}
-
-// stampDelivered records the delivery in job.json — but re-reads first, because
-// delivery can retry for minutes and a second 🎙️ click re-records into the same
-// directory meanwhile. Writing the stale copy back would resurrect "finished"
-// over a live recording. StartedAt is the generation marker: Start stamps it
-// afresh every time.
-// ponytail: a Start landing between the read and the save still wins the
-// clobber; put the stamp behind the runner's mutex if that ever bites.
-func stampDelivered(cfg Config, job Job) {
-	cur, err := loadJob(cfg.DataDir, job.ID)
-	if err != nil || cur.State != JobFinished || !cur.StartedAt.Equal(job.StartedAt) {
-		slog.Info("webhook delivered for a superseded job", "job", job.ID)
-		return
-	}
-	now := time.Now()
-	cur.WebhookSentAt = &now
-	if err := cur.save(cfg.DataDir); err != nil {
-		slog.Error("saving job", "job", job.ID, "err", err)
-	}
 }
 
 // resendUnsent hands every finished job whose webhook never went out back to the

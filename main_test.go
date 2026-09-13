@@ -111,42 +111,6 @@ func (f *fakeZulipServer) reactionLog() []string {
 	return append([]string(nil), f.reactions...)
 }
 
-// A delivery that lands after the message was re-recorded must not write its
-// stale copy back over the new recording.
-func TestStampDeliveredSkipsSupersededJob(t *testing.T) {
-	cfg := Config{DataDir: t.TempDir()}
-	old := testJob()
-	old.State = JobFinished
-	old.StartedAt = time.Now().Add(-time.Hour)
-
-	current := old
-	current.State = JobRecording
-	current.StartedAt = time.Now()
-	if err := current.save(cfg.DataDir); err != nil {
-		t.Fatal(err)
-	}
-
-	stampDelivered(cfg, old)
-
-	got, err := loadJob(cfg.DataDir, old.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != JobRecording || got.WebhookSentAt != nil {
-		t.Errorf("job.json = %+v, want the re-record untouched", got)
-	}
-
-	// The same job, not superseded, is stamped.
-	current.State = JobFinished
-	if err := current.save(cfg.DataDir); err != nil {
-		t.Fatal(err)
-	}
-	stampDelivered(cfg, current)
-	if got, err = loadJob(cfg.DataDir, current.ID); err != nil || got.WebhookSentAt == nil {
-		t.Errorf("job.json = %+v (%v), want webhook_sent_at", got, err)
-	}
-}
-
 func TestRunEndToEnd(t *testing.T) {
 	zulip, zulipURL := newFakeZulipServer(t)
 
