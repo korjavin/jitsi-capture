@@ -245,14 +245,18 @@ the whole deployment.
 
 ```bash
 cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR, DOMAIN
-docker build -t jitsi-capture .
+# compose has no `build:`, so build the image under the tag it references
+docker build -t ghcr.io/korjavin/jitsi-capture:latest .
 docker compose up -d
 docker compose logs -f
 ```
 
-`docker-compose.yml` expects an existing external Traefik network
-(`TRAEFIK_NETWORK_NAME`, default `traefik`) — it publishes no ports of its own,
-Traefik fronts the service on `DOMAIN`.
+`:latest` is only a local/placeholder tag — the registry holds SHA tags, so
+`docker compose pull` finds nothing to pull. `docker-compose.yml` also expects
+an existing external Traefik network (`TRAEFIK_NETWORK_NAME`, default
+`traefik`): it publishes no ports of its own, Traefik fronts the service on
+`DOMAIN`. Create the network once with
+`docker network create traefik` if it does not exist yet.
 
 ### Automated deployment (GitHub Actions → ghcr.io → Portainer)
 
