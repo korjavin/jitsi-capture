@@ -120,6 +120,9 @@ func (r *Runner) run(job Job, rec *recording) {
 	cmd := exec.Command(nodeBin, r.cfg.RecorderPath,
 		"--url", job.JitsiURL,
 		"--out", job.AudioPath,
+		// Per-participant audio next to the mixed file; the recorder reports the
+		// files it wrote back in the stdout JSON as tracks[].
+		"--tracks-dir", filepath.Join(jobDir(r.cfg.DataDir, job.ID), "tracks"),
 		"--join-timeout", strconv.Itoa(r.cfg.JoinTimeoutS),
 		"--max-duration", strconv.Itoa(r.cfg.MaxDurationS),
 		"--empty-grace", strconv.Itoa(r.cfg.EmptyGraceS),
