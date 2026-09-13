@@ -238,14 +238,33 @@ func TestRunSuccess(t *testing.T) {
 	if b, err := os.ReadFile(got.AudioPath); err != nil || len(b) == 0 {
 		t.Errorf("audio file: %v (%d bytes)", err, len(b))
 	}
+	// The fake recorder echoes back the --tracks-dir it was given, so this also
+	// pins where the runner tells the recorder to put per-participant audio.
+	wantTracks := []Track{{
+		ID:      "p1",
+		Name:    "Alice",
+		Path:    filepath.Join(jobDir(r.cfg.DataDir, job.ID), "tracks", "p1.webm"),
+		OffsetS: 1.5,
+		EndedS:  119,
+	}}
+	if !reflect.DeepEqual(got.Tracks, wantTracks) {
+		t.Errorf("tracks = %+v, want %+v", got.Tracks, wantTracks)
+	}
+	if b, err := os.ReadFile(wantTracks[0].Path); err != nil || len(b) == 0 {
+		t.Errorf("track file: %v (%d bytes)", err, len(b))
+	}
 	if !z.reactionRemoved(job.MessageID) {
 		t.Error("recording reaction was not removed")
 	}
 	if msgs := z.messages(); len(msgs) != 0 {
 		t.Errorf("a success posted a note: %v", msgs)
 	}
-	if saved := waitSettled(t, r.cfg.DataDir, job.ID); saved.State != JobFinished || saved.DurationS != 120 {
+	saved := waitSettled(t, r.cfg.DataDir, job.ID)
+	if saved.State != JobFinished || saved.DurationS != 120 {
 		t.Errorf("job.json = %+v, want finished/120", saved)
+	}
+	if !reflect.DeepEqual(saved.Tracks, wantTracks) {
+		t.Errorf("job.json tracks = %+v, want %+v", saved.Tracks, wantTracks)
 	}
 
 	select {

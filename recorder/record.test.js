@@ -102,3 +102,147 @@ test('shouldStop prefers max_duration over empty_room when both fire', () => {
   const both = shouldStop({ ...BASE, now: 14_400_000, membersCount: 1, aloneSince: 0 });
   assert.strictEqual(both.reason, 'max_duration');
 });
+
+// --- per-participant tracks (--tracks-dir) ----------------------------------
+
+const path = require('node:path');
+const { trackFile, applyTrackEvents, toJsonl, manifestRow, resultLine } = require('./record.js');
+
+test('parseArgs leaves tracksDir unset without the flag, and takes it with', () => {
+  assert.ok(!('tracksDir' in parseArgs(MIN)), 'the key must be absent, not empty');
+  assert.strictEqual(parseArgs([...MIN, '--tracks-dir', '/tmp/tr']).tracksDir, '/tmp/tr');
+  assert.throws(() => parseArgs([...MIN, '--tracks-dir']), /missing value/);
+});
+
+test('usage documents --tracks-dir', () => {
+  assert.match(USAGE, /--tracks-dir/);
+});
+
+test('trackFile keeps a participant id to one path segment', () => {
+  assert.strictEqual(trackFile('/d', 'a1b2c3'), path.join('/d', 'a1b2c3.webm'));
+  assert.strictEqual(trackFile('/d', '../../etc/passwd'), path.join('/d', '______etc_passwd.webm'));
+});
+
+test('applyTrackEvents builds the manifest and the speaker timeline', () => {
+  const tracks = new Map();
+  const speakers = applyTrackEvents(
+    tracks,
+    [
+      { type: 'start', id: 'p1', name: '', t: 1.25 },
+      { type: 'name', id: 'p1', name: 'First' },
+      { type: 'speaker', id: 'p1', name: 'First', t: 2 },
+      { type: 'start', id: 'p2', name: 'Second', t: 3.5 },
+      { type: 'speaker', id: 'p2', name: 'Second', t: 4.5 },
+      { type: 'end', id: 'p1', t: 30.125 },
+    ],
+    '/d/tracks'
+  );
+
+  assert.deepStrictEqual(
+    [...tracks.values()],
+    [
+      {
+        id: 'p1',
+        name: 'First',
+        path: path.resolve('/d/tracks/p1.webm'),
+        offset_s: 1.25,
+        ended_s: 30.125,
+      },
+      {
+        id: 'p2',
+        name: 'Second',
+        path: path.resolve('/d/tracks/p2.webm'),
+        offset_s: 3.5,
+        ended_s: 3.5,
+      },
+    ]
+  );
+  assert.deepStrictEqual(speakers, [
+    { t_s: 2, id: 'p1', name: 'First' },
+    { t_s: 4.5, id: 'p2', name: 'Second' },
+  ]);
+});
+
+test('applyTrackEvents ignores events for a track it never saw start', () => {
+  const tracks = new Map();
+  const speakers = applyTrackEvents(
+    tracks,
+    [
+      { type: 'end', id: 'ghost', t: 5 },
+      { type: 'name', id: 'ghost', name: 'Nobody' },
+    ],
+    '/d'
+  );
+  assert.strictEqual(tracks.size, 0);
+  assert.deepStrictEqual(speakers, []);
+});
+
+test('applyTrackEvents keeps the first offset when one id starts twice', () => {
+  const tracks = new Map();
+  applyTrackEvents(
+    tracks,
+    [
+      { type: 'start', id: 'p1', name: 'First', t: 1 },
+      { type: 'end', id: 'p1', t: 4 },
+      { type: 'start', id: 'p1', name: 'First', t: 6 },
+      { type: 'end', id: 'p1', t: 9 },
+    ],
+    '/d'
+  );
+  assert.deepStrictEqual(
+    [...tracks.values()].map((t) => [t.offset_s, t.ended_s]),
+    [[1, 9]]
+  );
+});
+
+test('toJsonl writes one parseable object per line, nothing for an empty list', () => {
+  const tracks = new Map();
+  applyTrackEvents(
+    tracks,
+    [
+      { type: 'start', id: 'p1', name: 'First', t: 0.5 },
+      { type: 'end', id: 'p1', t: 12 },
+    ],
+    '/d'
+  );
+  const body = toJsonl([...tracks.values()].map(manifestRow));
+  assert.strictEqual(body.at(-1), '\n');
+  const rows = body.trimEnd().split('\n').map(JSON.parse);
+  assert.deepStrictEqual(rows, [{ id: 'p1', name: 'First', offset_s: 0.5, ended_s: 12 }]);
+  assert.strictEqual(toJsonl([]), '');
+});
+
+test('resultLine omits tracks entirely without --tracks-dir', () => {
+  const base = {
+    out: '/d/audio.webm',
+    durationS: 114.14,
+    reason: 'empty_room',
+    participants: ['A'],
+  };
+  assert.strictEqual(
+    resultLine({ ...base, tracks: null }),
+    '{"out":"/d/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["A"]}\n'
+  );
+});
+
+test('resultLine appends the tracks array with --tracks-dir', () => {
+  const track = { id: 'p1', name: 'First', path: '/d/tracks/p1.webm', offset_s: 1, ended_s: 2 };
+  const parsed = JSON.parse(
+    resultLine({
+      out: '/d/audio.webm',
+      durationS: 10,
+      reason: 'signal',
+      participants: ['First'],
+      tracks: [track],
+    })
+  );
+  assert.deepStrictEqual(parsed.tracks, [track]);
+  assert.strictEqual(Object.keys(parsed).at(-1), 'tracks');
+});
+
+test('resultLine still emits an empty tracks array when nobody was recorded', () => {
+  const parsed = JSON.parse(
+    resultLine({ out: '/d/a.webm', durationS: 1, reason: 'signal', participants: [], tracks: [] })
+  );
+  assert.deepStrictEqual(parsed.tracks, []);
+});

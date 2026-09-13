@@ -9,13 +9,14 @@ below is the contract.
 
 ```bash
 node record.js --url <https://jitsi.example.com/ROOM> --out <path/audio.webm> \
+  [--tracks-dir <dir>] \
   [--join-timeout <sec, default 600>] \
   [--max-duration <sec, default 14400>] \
   [--empty-grace <sec, default 60>] \
   [--display-name <str, default NoteTaker>]
 ```
 
-The parent directory of `--out` is created if missing.
+The parent directory of `--out` is created if missing, as is `--tracks-dir`.
 
 ### stdout
 
@@ -29,6 +30,8 @@ Exactly one JSON line, on success only:
 * `participants` — display names of non-bot participants seen at any point
   during the recording, deduped, first-seen order. Hidden participants
   (transcriber/SIP ghosts) and nameless ones are omitted.
+* `tracks` — present **only** with `--tracks-dir` (see below). Without the flag
+  the line is byte-identical to the one above.
 
 All logs go to **stderr**, each line prefixed with an ISO timestamp. The room
 name is logged, never the full URL — it may carry a JWT or a password.
@@ -57,8 +60,54 @@ ffmpeg, no WAV conversion — the downstream transcriber decodes WebM/Opus itsel
 has no seek cues); that is normal and decoders still read every frame. Use the
 `duration_s` field from the JSON line.
 
-Audio is the **mixed** conference stream, one track for everybody. Per-speaker
-tracks are a separate piece of work.
+`--out` is the **mixed** conference stream, one track for everybody.
+
+## Per-participant tracks (`--tracks-dir`)
+
+Purely additive: without the flag nothing below happens and the mixed-only
+behaviour — including the stdout line, byte for byte — is unchanged.
+
+With `--tracks-dir <dir>` the recorder also writes, next to the mixed file:
+
+| file | contents |
+|------|----------|
+| `<dir>/<participantId>.webm` | one WebM/Opus file per remote participant, that participant's audio only |
+| `<dir>/tracks.jsonl` | one line per track: `{"id","name","offset_s","ended_s"}` |
+| `<dir>/speakers.jsonl` | dominant-speaker timeline, one line per change: `{"t_s","id","name"}` |
+
+and the stdout JSON gains a `tracks` array with absolute paths:
+
+```json
+{"out":"/data/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["Alice","Bob"],
+ "tracks":[{"id":"a1b2c3d4","name":"Alice","path":"/data/tracks/a1b2c3d4.webm","offset_s":2.104,"ended_s":113.8}]}
+```
+
+* `offset_s` — seconds between the start of the mixed recording and the moment
+  this track's recorder started, so a transcript of the track can be merged into
+  the meeting timeline by adding the offset.
+* `ended_s` — when it stopped (the participant left, or the call ended).
+* `speakers.jsonl` is the fallback for the consumer when a track is missing.
+
+How it works: the same 2 s poll walks Jitsi's redux
+`features/base/tracks` for remote audio tracks, and pipes each one through a
+shared `AudioContext` (`MediaStreamSource` → `MediaStreamDestination`) into its
+own `MediaRecorder(…, 'audio/webm;codecs=opus').start(1000)`. The AudioContext
+hop matters: recording a remote track directly stalls the MediaRecorder clock
+while that participant is muted, which would desynchronise the offsets. Nothing
+is ever connected to `ctx.destination`, so the mixed tab capture is untouched.
+Chunks cross into Node base64-encoded over `page.exposeFunction` (the bridge
+carries strings only) and are appended to the file as they arrive — a chunked
+MediaRecorder WebM stays playable that way, the first chunk carries the header,
+so **do not re-mux**.
+
+Known limits:
+
+* Somebody who rejoins gets a new Jitsi participant id, and therefore a second
+  file; deduplicating by display name is the consumer's job.
+* A participant who joined muted has no audio track yet — the poll picks them up
+  when one appears, and their `offset_s` reflects that later start.
+* Per-participant capture is best-effort: if it cannot be set up, the failure is
+  logged and the mixed recording continues alone.
 
 ## Environment
 
@@ -80,8 +129,10 @@ that needs `xvfb` in the image, so prefer keeping new-headless working.
 Join config is passed in the URL hash (`config.prejoinConfig.enabled=false`,
 `startWithAudioMuted`, `startWithVideoMuted`, `userInfo.displayName`), so the
 bot never clicks the UI. The join phase then polls Jitsi's internal `window.APP`
-every 2 s — all of it in `readJitsiState()`, so a Jitsi UI change is a one-place
-fix. Verified against live Jitsi on **2026-09-13**:
+every 2 s — all of it in `readJitsiState()` and, for per-participant tracks,
+`pollTracks()`; those two page-side functions are the only ones that touch
+`window.APP`, so a Jitsi change stays a one-place fix. Verified against live
+Jitsi on **2026-09-13**:
 
 * `APP.conference.isJoined()` → joined
 * `APP.store.getState()['features/lobby'].knocking` → parked in the lobby,
@@ -118,6 +169,7 @@ PUPPETEER_SKIP_DOWNLOAD=1 npm ci
 npm test        # node --check record.js && node --test
 ```
 
-`parseArgs`, `buildUrl`, `roomName` and `shouldStop` are exported and covered.
-No browser is launched and no network is touched; the browser paths are
-verified manually against a throwaway room.
+`parseArgs`, `buildUrl`, `roomName`, `shouldStop` and the per-track pure
+helpers (`trackFile`, `applyTrackEvents`, `toJsonl`, `manifestRow`,
+`resultLine`) are exported and covered. No browser is launched and no network is
+touched; the browser paths are verified manually against a throwaway room.
