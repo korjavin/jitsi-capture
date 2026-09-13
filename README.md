@@ -210,7 +210,7 @@ dotenv loading — Compose passes `.env` through `env_file`.
 | `ZULIP_BOT_API_KEY` | — *(required)* | Generic bot's API key |
 | `JITSI_BASE_URL` | `https://meet.jit.si` | Only links under this URL are offered a recording |
 | `DATA_DIR` | `/data` | Container path; jobs live in `DATA_DIR/jobs/<id>/` |
-| `HOST_DATA_DIR` | = `DATA_DIR` | Host path of the bind mount; used for `audio_path` |
+| `HOST_DATA_DIR` | = `DATA_DIR` | Path where the shared data volume is mounted in the consumer (transcriber) container; leave unset when both mount the same named volume at `DATA_DIR` |
 | `RECORDER_PATH` | `recorder/record.js` | Node recorder (the image sets `/app/recorder/record.js`) |
 | `BOT_DISPLAY_NAME` | `NoteTaker` | Display name in the call |
 | `JOIN_TIMEOUT_S` | `600` | Give up if not admitted within this many seconds |
@@ -241,29 +241,73 @@ the whole deployment.
    only sees messages in streams it is subscribed to.
 3. The bot needs no admin rights: it reads messages and adds reactions.
 
-### Run it
+### Run it locally
 
 ```bash
-cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR
-docker compose up -d --build
+cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, DOMAIN
+# compose has no `build:`, so build the image under the tag it references
+docker build -t ghcr.io/korjavin/jitsi-capture:latest .
+docker compose up -d
 docker compose logs -f
 ```
 
-With **Portainer**, deploy as a git-ops stack: point a stack at this repository,
-let Portainer build the image, and set the same variables in the stack's
-environment — no `.env` file is needed there, `docker-compose.yml` passes every
-variable through from whatever environment Compose runs in. The parts that
-matter:
+`:latest` is only a local/placeholder tag — the registry holds SHA tags, so
+`docker compose pull` finds nothing to pull. `docker-compose.yml` also expects
+an existing external Traefik network (`TRAEFIK_NETWORK_NAME`, default
+`traefik`): it publishes no ports of its own, Traefik fronts the service on
+`DOMAIN`. Create the network once with
+`docker network create traefik` if it does not exist yet.
 
-* **`HOST_DATA_DIR` bind mount** — job state and audio must survive a redeploy.
-  Create the directory on the host first (`mkdir -p /srv/jitsi-capture/data`).
+### Automated deployment (GitHub Actions → ghcr.io → Portainer)
+
+`.github/workflows/deploy.yml` runs on every push to `master` (and on
+`workflow_dispatch`):
+
+1. builds the image and pushes it to `ghcr.io/korjavin/jitsi-capture:<sha>`;
+2. checks out a `deploy` branch, rewrites the `image:` line in
+   `docker-compose.yml` with that SHA tag, commits `[skip ci]` and force-pushes
+   `deploy`;
+3. calls the Portainer redeploy webhook stored in the repository secret
+   `PORTAINER_REDEPLOY_HOOK` (skipped when the secret is empty).
+
+`master` keeps `image: ghcr.io/korjavin/jitsi-capture:latest` as a placeholder;
+only the `deploy` branch carries an immutable SHA tag. **Point the Portainer
+git-ops stack at branch `deploy`**, never at `master`, and paste the webhook URL
+Portainer generates into the `PORTAINER_REDEPLOY_HOOK` secret.
+
+Portainer pulls the image, so no `.env` file exists on the node —
+`docker-compose.yml` passes every variable through from the stack environment.
+Set these in the stack:
+
+| Variable | Notes |
+| --- | --- |
+| `ZULIP_SITE`, `ZULIP_BOT_EMAIL`, `ZULIP_BOT_API_KEY` | required |
+| `JITSI_BASE_URL` | required |
+| `WEBHOOK_URL`, `WEBHOOK_SECRET` | transcriber endpoint + shared secret |
+| `PUBLIC_URL` | how the transcriber reaches this service (`callback_url` prefix) |
+| `DATA_DIR` | container path (default `/data`) |
+| `HOST_DATA_DIR` | leave **unset** — see the named volume below |
+| `DOMAIN` | public hostname Traefik routes to this service |
+| `TRAEFIK_NETWORK_NAME` | existing external Traefik network (default `traefik`) |
+| `TRAEFIK_CERTRESOLVER` | Traefik ACME resolver (default `myresolver`) |
+| `AUDIO_RETENTION_DAYS`, `LOG_LEVEL`, … | optional, see [§5](#5-environment-variables) |
+
+The parts that matter:
+
+* **The `jitsi-capture-data` named volume** — job state and audio live there and
+  survive a redeploy. It is declared with a fixed name, so the transcriber stack
+  mounts the very same volume as `external: true` at the same path; that is why
+  `HOST_DATA_DIR` stays unset (the service then defaults it to `DATA_DIR` and
+  the `audio_path` in the webhook needs no translation). Only set
+  `HOST_DATA_DIR` if the receiving service sees the recordings under a
+  different path.
 * **`shm_size: 1g`** — Chromium crashes on longer calls with Docker's 64 MB
   default `/dev/shm`.
 * **`stop_grace_period: 120s`** — lets an in-flight recording finalize its file
   and deliver its webhook on `SIGTERM`. Do not lower it.
 * **RAM** — roughly 400–800 MB per concurrent recording (one Chromium each).
-* Port `8080` only has to be reachable by the sibling `transcriber` /
-  `tr2outline`; it needs no public exposure.
+* Port `8080` is reached through Traefik, or directly by the sibling
+  `transcriber` / `tr2outline` on the shared Docker network.
 
 ### Smoke checklist
 
@@ -272,7 +316,9 @@ matter:
 3. Click it → a 🔴 reaction appears.
 4. **Admit `NoteTaker`** from the Jitsi lobby (a human has to do this).
 5. Talk for more than 15 seconds, then everyone leaves the call.
-6. `HOST_DATA_DIR/jobs/<message-id>/job.json` shows `"state": "finished"` with a
+6. `DATA_DIR/jobs/<message-id>/job.json` in the `jitsi-capture-data` volume
+   (`docker compose exec jitsi-capture cat /data/jobs/<message-id>/job.json`)
+   shows `"state": "finished"` with a
    non-zero `duration_s`, next to `audio.webm`; the receiver logs the
    `recording.finished` webhook. The 🔴 reaction is gone.
 
