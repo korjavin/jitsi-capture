@@ -60,6 +60,17 @@ func (f *botFixture) reactions() []string {
 	return out
 }
 
+// removed returns the emoji names deleted, in request order.
+func (f *botFixture) removed() []string {
+	var out []string
+	for _, r := range f.srv.requests() {
+		if r.method == http.MethodDelete && strings.HasSuffix(r.path, "/reactions") {
+			out = append(out, r.form.Get("emoji_name"))
+		}
+	}
+	return out
+}
+
 func (f *botFixture) startedJobs() []Job {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -160,20 +171,68 @@ func TestBotStartsTheExpectedJob(t *testing.T) {
 	}
 }
 
+// The indicator is added before the job starts, so a start that never took hold
+// has to take it back off again. A duplicate click leaves it alone: the running
+// job still owns it.
 func TestBotStartFailures(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
+		name        string
+		err         error
+		wantRemoved []string
 	}{
-		{"a duplicate click adds no recording reaction", ErrDuplicateJob},
-		{"a failed start adds no recording reaction", errors.New("disk full")},
+		{"a duplicate click leaves the running job's indicator alone", ErrDuplicateJob, nil},
+		{"a failed start takes its own indicator back off", errors.New("disk full"), []string{recordingEmoji}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newBotFixture(t, "https://meet.jit.si", streamMessage(), tc.err)
 			f.bot.handle(context.Background(), Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100})
-			if got := f.reactions(); len(got) != 0 {
-				t.Errorf("reactions = %v; want none", got)
+			if got := f.reactions(); !reflect.DeepEqual(got, []string{recordingEmoji}) {
+				t.Errorf("reactions = %v; want [%s]", got, recordingEmoji)
+			}
+			if got := f.removed(); !reflect.DeepEqual(got, tc.wantRemoved) {
+				t.Errorf("removed = %v; want %v", got, tc.wantRemoved)
+			}
+		})
+	}
+}
+
+// A truncated room URL would silently record a different call, and a query or
+// fragment can carry a JWT or room password that must never reach the job record.
+func TestBotRoomURLExtraction(t *testing.T) {
+	tests := []struct {
+		name, content, want string
+	}{
+		{"the call button link", testContent, testRoomURL},
+		{"a dot in the room name", "[Join video call.](https://meet.jit.si/team.sync)", "https://meet.jit.si/team.sync"},
+		{"a percent-encoded room name", "https://meet.jit.si/team%20sync", "https://meet.jit.si/team%20sync"},
+		{"a link at the end of a sentence", "we are in https://meet.jit.si/fakeroom.", testRoomURL},
+		{"a jwt in the query is dropped", "https://meet.jit.si/fakeroom?jwt=secret-token", testRoomURL},
+		{"a fragment is dropped", "https://meet.jit.si/fakeroom#config.startAudioOnly=true", testRoomURL},
+		{"the bare base url is not a room", "https://meet.jit.si/", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := streamMessage()
+			msg.Content = tc.content
+			f := newBotFixture(t, "https://meet.jit.si", msg, nil)
+			f.bot.handle(context.Background(), Event{Type: "reaction", Op: "add", EmojiName: micEmoji, UserID: 42, MessageID: 100})
+
+			jobs := f.startedJobs()
+			if tc.want == "" {
+				if len(jobs) != 0 {
+					t.Fatalf("started %+v; want no job", jobs)
+				}
+				return
+			}
+			if len(jobs) != 1 {
+				t.Fatalf("started %d jobs; want 1", len(jobs))
+			}
+			if jobs[0].JitsiURL != tc.want {
+				t.Errorf("JitsiURL = %q; want %q", jobs[0].JitsiURL, tc.want)
+			}
+			if strings.ContainsAny(jobs[0].JitsiURL, "?#") {
+				t.Errorf("JitsiURL %q carries a query or fragment", jobs[0].JitsiURL)
 			}
 		})
 	}

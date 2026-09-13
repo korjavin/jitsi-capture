@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,8 +29,12 @@ func newBot(cfg Config, z *Zulip, start func(Job) error) *Bot {
 		z:     z,
 		start: start,
 		// Zulip's call button posts "[Join video call.](<base>/<room>)" — the raw
-		// content is enough, no markdown parsing needed.
-		jitsiRe: regexp.MustCompile(regexp.QuoteMeta(cfg.JitsiBaseURL) + `/[A-Za-z0-9_-]+`),
+		// content is enough, no markdown parsing needed. The room segment runs to
+		// the first character markdown or prose can put after it: a narrower class
+		// would truncate a legitimate name like "team.sync" and silently send the
+		// recorder into a different room. "?" and "#" end it too, so a JWT or a
+		// room password never reaches the job record or the logs.
+		jitsiRe: regexp.MustCompile(regexp.QuoteMeta(cfg.JitsiBaseURL) + "/[^\\s<>()\\[\\]{}\"'`?#|]+"),
 	}
 }
 
@@ -113,8 +118,11 @@ func (b *Bot) startJob(ctx context.Context, msgID int64) {
 	if m.Type != "stream" {
 		return
 	}
-	roomURL := b.jitsiRe.FindString(m.Content)
-	if roomURL == "" {
+	// ponytail: sentence punctuation right after a pasted link is trimmed, so a
+	// room literally named "standup." is unreachable from prose. Drop the trim if
+	// anyone ever names one that.
+	roomURL := strings.TrimRight(b.jitsiRe.FindString(m.Content), ".,;:!")
+	if roomURL == "" || strings.HasSuffix(roomURL, "/") {
 		return
 	}
 	job := Job{
@@ -124,16 +132,22 @@ func (b *Bot) startJob(ctx context.Context, msgID int64) {
 		Topic:     m.Subject,
 		JitsiURL:  roomURL,
 	}
+	// The "recording now" indicator goes on before the job starts, not after: the
+	// runner clears it when the job ends, and a recorder that dies immediately can
+	// clear it before an add issued afterwards would land — stranding a red dot on
+	// a message whose recording already failed.
+	addErr := b.z.AddReaction(ctx, msgID, recordingEmoji)
 	switch err := b.start(job); {
 	case errors.Is(err, ErrDuplicateJob):
-		// Already recording — a second click is a no-op, silently.
+		// Already recording: the indicator is already there, so addErr is the
+		// expected "reaction already exists". A second click is a silent no-op.
 	case err != nil:
 		slog.Error("starting the recording failed", "job", job.ID, "err", err)
-	default:
-		// Visual "recording now" indicator; the runner removes it when the job ends.
-		if err := b.z.AddReaction(ctx, msgID, recordingEmoji); err != nil {
-			slog.Error("adding the recording reaction failed", "message_id", msgID, "err", err)
+		if err := b.z.RemoveReaction(ctx, msgID, recordingEmoji); err != nil {
+			slog.Error("removing the recording reaction failed", "message_id", msgID, "err", err)
 		}
+	case addErr != nil:
+		slog.Error("adding the recording reaction failed", "message_id", msgID, "err", addErr)
 	}
 }
 
