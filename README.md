@@ -241,29 +241,65 @@ the whole deployment.
    only sees messages in streams it is subscribed to.
 3. The bot needs no admin rights: it reads messages and adds reactions.
 
-### Run it
+### Run it locally
 
 ```bash
-cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR
-docker compose up -d --build
+cp .env.example .env     # fill in ZULIP_*, WEBHOOK_*, HOST_DATA_DIR, DOMAIN
+docker build -t jitsi-capture .
+docker compose up -d
 docker compose logs -f
 ```
 
-With **Portainer**, deploy as a git-ops stack: point a stack at this repository,
-let Portainer build the image, and set the same variables in the stack's
-environment — no `.env` file is needed there, `docker-compose.yml` passes every
-variable through from whatever environment Compose runs in. The parts that
-matter:
+`docker-compose.yml` expects an existing external Traefik network
+(`TRAEFIK_NETWORK_NAME`, default `traefik`) — it publishes no ports of its own,
+Traefik fronts the service on `DOMAIN`.
+
+### Automated deployment (GitHub Actions → ghcr.io → Portainer)
+
+`.github/workflows/deploy.yml` runs on every push to `master` (and on
+`workflow_dispatch`):
+
+1. builds the image and pushes it to `ghcr.io/korjavin/jitsi-capture:<sha>`;
+2. checks out a `deploy` branch, rewrites the `image:` line in
+   `docker-compose.yml` with that SHA tag, commits `[skip ci]` and force-pushes
+   `deploy`;
+3. calls the Portainer redeploy webhook stored in the repository secret
+   `PORTAINER_REDEPLOY_HOOK` (skipped when the secret is empty).
+
+`master` keeps `image: ghcr.io/korjavin/jitsi-capture:latest` as a placeholder;
+only the `deploy` branch carries an immutable SHA tag. **Point the Portainer
+git-ops stack at branch `deploy`**, never at `master`, and paste the webhook URL
+Portainer generates into the `PORTAINER_REDEPLOY_HOOK` secret.
+
+Portainer pulls the image, so no `.env` file exists on the node —
+`docker-compose.yml` passes every variable through from the stack environment.
+Set these in the stack:
+
+| Variable | Notes |
+| --- | --- |
+| `ZULIP_SITE`, `ZULIP_BOT_EMAIL`, `ZULIP_BOT_API_KEY` | required |
+| `JITSI_BASE_URL` | required |
+| `WEBHOOK_URL`, `WEBHOOK_SECRET` | transcriber endpoint + shared secret |
+| `PUBLIC_URL` | how the transcriber reaches this service (`callback_url` prefix) |
+| `HOST_DATA_DIR` | **host path on the Portainer node** for the bind mount |
+| `DATA_DIR` | container path (default `/data`) |
+| `DOMAIN` | public hostname Traefik routes to this service |
+| `TRAEFIK_NETWORK_NAME` | existing external Traefik network (default `traefik`) |
+| `TRAEFIK_CERTRESOLVER` | Traefik ACME resolver (default `myresolver`) |
+| `AUDIO_RETENTION_DAYS`, `LOG_LEVEL`, … | optional, see [§5](#5-environment-variables) |
+
+The parts that matter:
 
 * **`HOST_DATA_DIR` bind mount** — job state and audio must survive a redeploy.
-  Create the directory on the host first (`mkdir -p /srv/jitsi-capture/data`).
+  It is a path on the Portainer node, not in this repository; create it there
+  first (`mkdir -p /srv/jitsi-capture/data`).
 * **`shm_size: 1g`** — Chromium crashes on longer calls with Docker's 64 MB
   default `/dev/shm`.
 * **`stop_grace_period: 120s`** — lets an in-flight recording finalize its file
   and deliver its webhook on `SIGTERM`. Do not lower it.
 * **RAM** — roughly 400–800 MB per concurrent recording (one Chromium each).
-* Port `8080` only has to be reachable by the sibling `transcriber` /
-  `tr2outline`; it needs no public exposure.
+* Port `8080` is reached through Traefik, or directly by the sibling
+  `transcriber` / `tr2outline` on the shared Docker network.
 
 ### Smoke checklist
 
