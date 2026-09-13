@@ -210,7 +210,7 @@ dotenv loading — Compose passes `.env` through `env_file`.
 | `ZULIP_BOT_API_KEY` | — *(required)* | Generic bot's API key |
 | `JITSI_BASE_URL` | `https://meet.jit.si` | Only links under this URL are offered a recording |
 | `DATA_DIR` | `/data` | Container path; jobs live in `DATA_DIR/jobs/<id>/` |
-| `HOST_DATA_DIR` | = `DATA_DIR` | Host path of the bind mount; used for `audio_path` |
+| `HOST_DATA_DIR` | = `DATA_DIR` | Path where the shared data volume is mounted in the consumer (transcriber) container; leave unset when both mount the same named volume at `DATA_DIR` |
 | `RECORDER_PATH` | `recorder/record.js` | Node recorder (the image sets `/app/recorder/record.js`) |
 | `BOT_DISPLAY_NAME` | `NoteTaker` | Display name in the call |
 | `JOIN_TIMEOUT_S` | `600` | Give up if not admitted within this many seconds |
