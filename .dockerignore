@@ -1,0 +1,10 @@
+.git
+.github
+.beads
+.claude
+.agents
+.codex
+**/node_modules
+data
+.env
+**/__pycache__
