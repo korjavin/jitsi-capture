@@ -39,7 +39,7 @@ func newBotFixture(t *testing.T, jitsiBase string, msg Message, startErr error) 
 		ok(w, "")
 	})
 	f.srv = srv
-	f.bot = newBot(Config{JitsiBaseURL: jitsiBase}, z, func(_ context.Context, j Job) error {
+	f.bot = newBot(Config{JitsiBaseURL: jitsiBase}, z, func(j Job) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.jobs = append(f.jobs, j)
@@ -334,7 +334,7 @@ func TestBotRunReRegistersOnExpiredQueue(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bot := newBot(Config{JitsiBaseURL: "https://meet.jit.si"}, z, func(context.Context, Job) error { return nil })
+	bot := newBot(Config{JitsiBaseURL: "https://meet.jit.si"}, z, func(Job) error { return nil })
 	done := make(chan error, 1)
 	go func() { done <- bot.Run(ctx) }()
 
@@ -377,7 +377,7 @@ func TestBotRunFailsOnBadCredentials(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, `{"result":"error","msg":"Invalid API key"}`)
 	})
-	err := newBot(Config{JitsiBaseURL: "https://meet.jit.si"}, z, func(context.Context, Job) error { return nil }).Run(context.Background())
+	err := newBot(Config{JitsiBaseURL: "https://meet.jit.si"}, z, func(Job) error { return nil }).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "zulip identity") {
 		t.Fatalf("Run() = %v; want a zulip identity error", err)
 	}

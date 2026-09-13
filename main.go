@@ -57,19 +57,18 @@ func main() {
 func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	z := newZulip(cfg)
 
-	// The webhook outlives ctx on purpose: SIGTERM makes the recorder finalize
-	// and exit 0, so the job that shutdown produces is precisely the one worth
-	// delivering. sendWebhook's backoff table bounds the attempt.
-	hookCtx := context.WithoutCancel(ctx)
-	// The runner's Zulip calls outlive ctx for the same reason: a recording that
-	// SIGTERM finalized still has to post its note and drop its 🔴. Cancelled
-	// when run returns, so nothing is left hanging on a dead service.
-	zulipCtx, endZulipCalls := context.WithCancel(context.WithoutCancel(ctx))
-	defer endZulipCalls()
+	// One context for the work that has to outlive ctx: SIGTERM makes the
+	// recorder finalize and exit 0, so the job that shutdown produces is
+	// precisely the one worth delivering — and the settlement producing it still
+	// has to post its note and drop its 🔴. sendWebhook's backoff table bounds
+	// the delivery; cancelling this when run returns bounds the rest, so nothing
+	// is left hanging on a service that is already gone.
+	bg, endBg := context.WithCancel(context.WithoutCancel(ctx))
+	defer endBg()
 	// Assigned below; every call reaches deliver through the runner itself.
 	var runner *Runner
 	deliver := func(job Job) {
-		if err := sendWebhook(hookCtx, cfg, job); err != nil {
+		if err := sendWebhook(bg, cfg, job); err != nil {
 			slog.Warn("webhook not delivered, will retry after the next sweep", "job", job.ID, "err", err)
 			return
 		}
@@ -90,7 +89,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		deliver(job)
 	}
 
-	runner = newRunner(zulipCtx, cfg, z, onFinished)
+	runner = newRunner(bg, cfg, z, onFinished)
 	sweepRetention(cfg.DataDir, cfg.AudioRetentionDays)
 
 	srv := newHTTPServer(cfg.ListenAddr, (&server{

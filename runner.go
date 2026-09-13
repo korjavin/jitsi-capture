@@ -45,9 +45,15 @@ type Runner struct {
 	mu       sync.Mutex
 	stopping bool
 	running  map[string]*recording
+	// indicators serializes the indicator calls per message; see lockIndicator.
+	indicators map[int64]*indicator
+}
 
-	// indMu serializes the recording-indicator calls; see syncIndicator.
-	indMu sync.Mutex
+// indicator is one message's indicator lock. waiting counts the callers holding
+// or queued on it, so the map entry lives exactly as long as it is needed.
+type indicator struct {
+	mu      sync.Mutex
+	waiting int
 }
 
 // recording tracks one accepted job from Start until its final state is on
@@ -72,8 +78,8 @@ const (
 	errInterrupted    = "interrupted"
 )
 
-// recordingEmoji is the reaction the bot adds while recording and removes when
-// the job ends, whatever the outcome.
+// recordingEmoji is the "recording now" indicator; the runner keeps it in step
+// with job.json (see syncIndicator).
 const recordingEmoji = "red_circle"
 
 // failNote maps a Job.Error to the single English line posted in the job's topic.
@@ -90,7 +96,11 @@ const (
 )
 
 func newRunner(ctx context.Context, cfg Config, z zulipAPI, onFinished func(Job)) *Runner {
-	return &Runner{ctx: ctx, cfg: cfg, z: z, onFinished: onFinished, running: map[string]*recording{}}
+	return &Runner{
+		ctx: ctx, cfg: cfg, z: z, onFinished: onFinished,
+		running:    map[string]*recording{},
+		indicators: map[int64]*indicator{},
+	}
 }
 
 // Start records the job as recording and spawns the recorder, whose goroutine
@@ -100,13 +110,15 @@ func newRunner(ctx context.Context, cfg Config, z zulipAPI, onFinished func(Job)
 // failed transiently still produces one. A previously failed or finished job
 // may be re-recorded, reusing its directory.
 //
-// ctx bounds the Zulip call Start itself may make; it is the event loop's, so
-// shutdown cuts it short instead of stalling the loop.
-func (r *Runner) Start(ctx context.Context, job Job) error {
+// It talks to nothing but the disk, so the event loop calling it never waits on
+// Zulip.
+func (r *Runner) Start(job Job) error {
 	rec, err := r.admit(&job)
 	if err != nil {
 		if errors.Is(err, ErrDuplicateJob) {
-			r.syncIndicator(ctx, job)
+			// Warn: Zulip rejects an add for a reaction that is already there,
+			// which is what this usually finds.
+			go r.syncIndicator(job, slog.LevelWarn)
 		}
 		return err
 	}
@@ -155,7 +167,7 @@ func (r *Runner) run(job Job, rec *recording) {
 	// call: the event loop must not wait for Zulip, while this goroutine is
 	// already covered by Stop's grace through rec.done. It is still on before
 	// the child spawns, so a recorder that dies at once finds it there to clear.
-	r.syncIndicator(r.ctx, job)
+	r.syncIndicator(job, slog.LevelError)
 
 	cmd := exec.Command(nodeBin, r.cfg.RecorderPath,
 		"--url", job.JitsiURL,
@@ -216,32 +228,51 @@ func (r *Runner) run(job Job, rec *recording) {
 	r.settle(job)
 }
 
-// settle persists the job, posts the failure note if any, brings the recording
-// indicator in line with the new state and hands a finished job to the webhook
-// sender.
+// settle persists the job and announces the outcome, then hands a finished job
+// to the webhook sender.
 func (r *Runner) settle(job Job) {
-	// The final state reaches disk before any network call: Stop is waiting for
-	// exactly this file, and a click racing the settlement has to be able to
-	// read it. The save shares Start's mutex because a settlement landing after
-	// a re-record's admission would otherwise resurrect "finished" over a live
-	// recording.
-	r.mu.Lock()
-	err := job.save(r.cfg.DataDir)
-	r.mu.Unlock()
-	if err != nil {
-		slog.Error("saving job", "job", job.ID, "err", err)
-	}
+	err := r.saveFinalState(job)
+	r.announce(job, err)
 
+	if job.State == JobFinished && r.onFinished != nil {
+		r.onFinished(job)
+	}
+}
+
+// saveFinalState writes the settled job under the mutex Start's admission takes,
+// because a settlement landing after a re-record's admission would otherwise
+// resurrect "finished" over a live recording. It runs before any network call:
+// Stop is waiting for exactly this file, and a click racing the settlement has
+// to be able to read it.
+func (r *Runner) saveFinalState(job Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := job.save(r.cfg.DataDir); err != nil {
+		slog.Error("saving job", "job", job.ID, "err", err)
+		return err
+	}
+	return nil
+}
+
+// announce posts the failure note if any and brings the indicator in line with
+// the settled state. Both are Zulip calls, so a caller that must not block —
+// Resume, on the startup path — runs it on a goroutine.
+//
+// saveErr is what saveFinalState reported: when the save failed, job.json still
+// says "recording", so reading it back would put the indicator on a job that
+// has already ended. The in-memory state is the only truth left.
+func (r *Runner) announce(job Job, saveErr error) {
 	// After the save, never before: whoever reads the note and clicks again
 	// must find a job that is no longer recording, not a silent no-op.
 	if job.State == JobFailed {
 		r.note(job)
 	}
-	r.syncIndicator(r.ctx, job)
-
-	if job.State == JobFinished && r.onFinished != nil {
-		r.onFinished(job)
+	if saveErr != nil {
+		r.clearIndicator(job)
+		return
 	}
+	r.syncIndicator(job, slog.LevelError)
 }
 
 func (r *Runner) note(job Job) {
@@ -256,43 +287,77 @@ func (r *Runner) note(job Job) {
 	}
 }
 
-// syncIndicator makes the recording indicator on the job's message match the
-// job state on disk — the same file Start's duplicate check reads.
+// syncIndicator makes the indicator on the job's message match the job state on
+// disk — the same file Start's duplicate check reads.
 //
 // Reading that state back, instead of carrying "add" or "remove" down from the
 // caller, is what makes concurrent updates safe without holding r.mu across the
-// network: indMu serializes the calls, so whichever one runs last read a state
-// at least as fresh as every save before it, and leaves the message matching
-// that state. A click racing a settlement therefore cannot lose its indicator
-// to the removal, and a settlement with no click behind it cannot strand one.
-// The price is an occasional redundant call inside that window, which Zulip
-// rejects harmlessly.
+// network: the message's indicator lock serializes the calls, so whichever one
+// runs last read a state at least as fresh as every save before it, and leaves
+// the message matching that state. A click racing a settlement therefore cannot
+// lose its indicator to the removal, and a settlement with no click behind it
+// cannot strand one. The price is an occasional redundant call inside that
+// window, which Zulip rejects harmlessly.
 //
-// ponytail: one lock for every message, so a hung Zulip delays the next
-// message's indicator by up to zulipTimeout — never a state transition, never a
-// shutdown. Per-message locks if a deployment ever records many calls at once.
-func (r *Runner) syncIndicator(ctx context.Context, job Job) {
-	r.indMu.Lock()
-	defer r.indMu.Unlock()
+// addFailure is the level a failed add is logged at: the re-assert a duplicate
+// click makes is expected to fail, an add on a fresh recording is not.
+func (r *Runner) syncIndicator(job Job, addFailure slog.Level) {
+	unlock := r.lockIndicator(job.MessageID)
+	defer unlock()
 
 	cur, err := loadJob(r.cfg.DataDir, job.ID)
 	if err != nil {
 		slog.Error("reading job state for the recording indicator", "job", job.ID, "err", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, zulipTimeout)
-	defer cancel()
-
-	// Warn, not Error: the indicator is cosmetic, and the redundant call a
-	// racing click produces comes back from Zulip as a failure.
 	if cur.State == JobRecording {
-		if err := r.z.AddReaction(ctx, job.MessageID, recordingEmoji); err != nil {
-			slog.Warn("adding the recording reaction", "job", job.ID, "err", err)
-		}
+		r.callIndicator(r.z.AddReaction, "adding", job, addFailure)
 		return
 	}
-	if err := r.z.RemoveReaction(ctx, job.MessageID, recordingEmoji); err != nil {
-		slog.Warn("removing the recording reaction", "job", job.ID, "err", err)
+	r.callIndicator(r.z.RemoveReaction, "removing", job, slog.LevelError)
+}
+
+// clearIndicator takes the indicator off without consulting job.json, for the
+// one caller that knows better than the file: a settlement whose save failed.
+func (r *Runner) clearIndicator(job Job) {
+	unlock := r.lockIndicator(job.MessageID)
+	defer unlock()
+	r.callIndicator(r.z.RemoveReaction, "removing", job, slog.LevelError)
+}
+
+func (r *Runner) callIndicator(call func(context.Context, int64, string) error, verb string, job Job, failure slog.Level) {
+	ctx, cancel := context.WithTimeout(r.ctx, zulipTimeout)
+	defer cancel()
+	if err := call(ctx, job.MessageID, recordingEmoji); err != nil {
+		slog.Log(ctx, failure, verb+" the recording reaction", "job", job.ID, "err", err)
+	}
+}
+
+// lockIndicator serializes the indicator updates for one message and returns
+// the release. Per message rather than one lock for all of them: a Zulip call
+// that hangs for zulipTimeout must not hold up another call's indicator, its
+// recorder's join, or the shutdown waiting on it. r.mu guards only the map
+// lookup and the refcount, never the wait — an entry lives exactly as long as
+// somebody holds or queues on it.
+func (r *Runner) lockIndicator(msgID int64) func() {
+	r.mu.Lock()
+	ind := r.indicators[msgID]
+	if ind == nil {
+		ind = &indicator{}
+		r.indicators[msgID] = ind
+	}
+	ind.waiting++
+	r.mu.Unlock()
+
+	ind.mu.Lock()
+	return func() {
+		ind.mu.Unlock()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		ind.waiting--
+		if ind.waiting == 0 {
+			delete(r.indicators, msgID)
+		}
 	}
 }
 
@@ -380,8 +445,11 @@ func (r *Runner) Resume() {
 			job.Error = errInterrupted
 			job.EndedAt = &now
 			slog.Warn("job interrupted by restart", "job", job.ID)
-			// The same ending every other failure gets: save, note, indicator.
-			r.settle(job)
+			// The same ending every other failure gets, except that the Zulip
+			// half runs on its own goroutine: repairs must not hold the startup
+			// path — and with it the signal handler — for a Zulip timeout each.
+			err := r.saveFinalState(job)
+			go r.announce(job, err)
 		case job.State == JobFinished && job.WebhookSentAt == nil:
 			slog.Info("retrying webhook after restart", "job", job.ID)
 			if r.onFinished != nil {

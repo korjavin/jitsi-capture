@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -36,7 +38,7 @@ type fakeZulip struct {
 	calls        []zulipCall
 	err          error
 	delay        time.Duration // stands in for a slow Zulip during shutdown
-	beforeRemove func()        // runs at the start of RemoveReaction
+	beforeRemove func(int64)   // runs at the start of RemoveReaction, with the message id
 	beforeSend   func()        // runs at the start of SendMessage
 }
 
@@ -49,7 +51,7 @@ func (f *fakeZulip) AddReaction(_ context.Context, msgID int64, emoji string) er
 
 func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string) error {
 	if f.beforeRemove != nil {
-		f.beforeRemove()
+		f.beforeRemove(msgID)
 	}
 	time.Sleep(f.delay)
 	f.mu.Lock()
@@ -142,16 +144,25 @@ func waitSettled(t *testing.T, dataDir, id string) Job {
 	return Job{}
 }
 
-// waitReactionRemoved polls for the recording reaction being dropped.
-func waitReactionRemoved(t *testing.T, z *fakeZulip, msgID int64) {
+// eventually polls cond until it holds, for the work the runner hands to a
+// goroutine so that the event loop and the startup path never wait on Zulip.
+func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
-		if z.reactionRemoved(msgID) {
+		if cond() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Errorf("recording reaction on %d was not removed", msgID)
+	t.Errorf("timed out waiting for %s", what)
+}
+
+// waitReactionRemoved polls for the recording reaction being dropped.
+func waitReactionRemoved(t *testing.T, z *fakeZulip, msgID int64) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("the recording reaction on %d to be removed", msgID), func() bool {
+		return z.reactionRemoved(msgID)
+	})
 }
 
 func TestJobSaveLoadRoundTrip(t *testing.T) {
@@ -225,17 +236,18 @@ func TestStartRejectsDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := r.Start(context.Background(), testJob()); !errors.Is(err, ErrDuplicateJob) {
+	if err := r.Start(testJob()); !errors.Is(err, ErrDuplicateJob) {
 		t.Fatalf("want ErrDuplicateJob, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(jobDir(r.cfg.DataDir, inflight.ID), "audio.webm")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("duplicate Start spawned a recorder")
 	}
-	// It re-asserts the indicator instead: the job is still recording, so a
-	// click after an add that failed transiently puts the 🔴 back.
-	if got, want := z.indicatorLog(inflight.MessageID), []string{callAdd}; !reflect.DeepEqual(got, want) {
-		t.Errorf("indicator changes = %v, want %v", got, want)
-	}
+	// It re-asserts the indicator instead — off the event loop, so the click
+	// costs the bot nothing: the job is still recording, so an add that failed
+	// transiently the first time is repaired by the second click.
+	eventually(t, "the indicator re-assert", func() bool {
+		return reflect.DeepEqual(z.indicatorLog(inflight.MessageID), []string{callAdd})
+	})
 	if msgs := z.messages(); len(msgs) != 0 {
 		t.Errorf("duplicate Start posted a note: %v", msgs)
 	}
@@ -259,7 +271,7 @@ func TestStartThatCannotSaveTouchesNoReactions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := r.Start(context.Background(), job)
+	err := r.Start(job)
 	if err == nil || errors.Is(err, ErrDuplicateJob) {
 		t.Fatalf("Start = %v, want a save failure", err)
 	}
@@ -276,7 +288,7 @@ func TestStartRerecordsFailedJob(t *testing.T) {
 	if err := old.save(r.cfg.DataDir); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Start(context.Background(), testJob()); err != nil {
+	if err := r.Start(testJob()); err != nil {
 		t.Fatalf("Start after a failed run: %v", err)
 	}
 	if got := (<-finished).State; got != JobFinished {
@@ -287,7 +299,7 @@ func TestStartRerecordsFailedJob(t *testing.T) {
 func TestRunSuccess(t *testing.T) {
 	r, z, finished := newTestRunner(t, "rec_ok.sh")
 	job := testJob()
-	if err := r.Start(context.Background(), job); err != nil {
+	if err := r.Start(job); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -370,9 +382,9 @@ func TestSettleSavesBeforeTalkingToZulip(t *testing.T) {
 			}
 			var atNote, atIndicator string
 			z.beforeSend = func() { atNote = stateOnDisk() }
-			z.beforeRemove = func() { atIndicator = stateOnDisk() }
+			z.beforeRemove = func(int64) { atIndicator = stateOnDisk() }
 
-			if err := r.Start(context.Background(), job); err != nil {
+			if err := r.Start(job); err != nil {
 				t.Fatalf("Start: %v", err)
 			}
 			waitSettled(t, r.cfg.DataDir, job.ID)
@@ -398,16 +410,16 @@ func TestStartAndSettleSerializeTheIndicator(t *testing.T) {
 
 	var once sync.Once
 	reStart := make(chan error, 1)
-	z.beforeRemove = func() {
+	z.beforeRemove = func(int64) {
 		once.Do(func() { // only the first settlement is raced
-			go func() { reStart <- r.Start(context.Background(), testJob()) }()
+			go func() { reStart <- r.Start(testJob()) }()
 			// Long enough for an unserialized Start to save, add its 🔴, and
 			// then lose it to the removal that follows.
 			time.Sleep(100 * time.Millisecond)
 		})
 	}
 
-	if err := r.Start(context.Background(), job); err != nil {
+	if err := r.Start(job); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	for i := 1; i <= 2; i++ {
@@ -427,6 +439,68 @@ func TestStartAndSettleSerializeTheIndicator(t *testing.T) {
 	}
 }
 
+// The indicator lock is per message, not one for all of them: a Zulip call that
+// hangs on one message must not hold up another message's indicator — which is
+// how a handful of jobs finalizing at once would push a shutdown past its grace.
+func TestIndicatorLockIsPerMessage(t *testing.T) {
+	r, z, _ := newTestRunner(t, "rec_ok.sh")
+	stuck, other := testJob(), testJob()
+	other.ID, other.MessageID = "43", 43
+	for _, j := range []Job{stuck, other} {
+		j.State = JobFinished
+		if err := j.save(r.cfg.DataDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	release := make(chan struct{})
+	defer close(release)
+	entered := make(chan struct{})
+	z.beforeRemove = func(msgID int64) {
+		if msgID != stuck.MessageID {
+			return
+		}
+		close(entered)
+		<-release
+	}
+
+	go r.syncIndicator(stuck, slog.LevelError)
+	<-entered // that message's removal is in flight and going nowhere
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.syncIndicator(other, slog.LevelError)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a hung indicator call on one message blocked another message's")
+	}
+}
+
+// Reading the state back is right only while the state is actually there. When
+// the settlement could not save, job.json still says "recording", so the
+// indicator has to come off on the strength of the in-memory job instead — or
+// it would be put back on a recording that has ended, for good.
+func TestSettleWithAFailedSaveStillClearsTheIndicator(t *testing.T) {
+	r, z, _ := newTestRunner(t, "rec_ok.sh")
+	live := testJob()
+	live.State = JobRecording
+	if err := live.save(r.cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+
+	ended := live
+	ended.State = JobFailed
+	ended.Error = errRecorderFailed
+	r.announce(ended, errors.New("no space left on device"))
+
+	if got, want := z.indicatorLog(live.MessageID), []string{callRemove}; !reflect.DeepEqual(got, want) {
+		t.Errorf("indicator changes = %v, want %v: the stale job.json won", got, want)
+	}
+}
+
 // Serializing the calls is only half of it: each one reads the state on disk
 // rather than trusting the copy its caller carries. That is what lets a
 // settlement whose removal runs after a re-click put the indicator back instead
@@ -441,7 +515,7 @@ func TestSyncIndicatorFollowsTheStateOnDisk(t *testing.T) {
 
 	stale := job
 	stale.State = JobFinished // what a settlement that lost the race carries
-	r.syncIndicator(context.Background(), stale)
+	r.syncIndicator(stale, slog.LevelError)
 
 	if got, want := z.indicatorLog(job.MessageID), []string{callAdd}; !reflect.DeepEqual(got, want) {
 		t.Errorf("indicator changes = %v, want %v: a live recording lost its indicator", got, want)
@@ -540,7 +614,7 @@ func TestRunFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r, z, finished := newTestRunner(t, tc.script)
 			job := testJob()
-			if err := r.Start(context.Background(), job); err != nil {
+			if err := r.Start(job); err != nil {
 				t.Fatalf("Start: %v", err)
 			}
 			got := waitSettled(t, r.cfg.DataDir, job.ID)
@@ -568,7 +642,7 @@ func TestStopWaitsForSettlement(t *testing.T) {
 	z.delay = 200 * time.Millisecond
 
 	job := testJob()
-	if err := r.Start(context.Background(), job); err != nil {
+	if err := r.Start(job); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	r.Stop(15 * time.Second)
@@ -625,12 +699,13 @@ func TestResume(t *testing.T) {
 	if got.State != JobFailed || got.Error != errInterrupted || got.EndedAt == nil {
 		t.Errorf("interrupted job = %+v, want failed/interrupted with ended_at", got)
 	}
-	if msgs := z.messages(); len(msgs) != 1 || msgs[0] != failNote[errInterrupted] {
-		t.Errorf("notes = %v, want the interrupted line", msgs)
-	}
-	if !z.reactionRemoved(interrupted.MessageID) {
-		t.Error("recording reaction was not removed for the interrupted job")
-	}
+	// The job is repaired on disk before Resume returns; the Zulip half of it
+	// follows on its own goroutine, so that the startup path stays interruptible.
+	eventually(t, "the interrupted note", func() bool {
+		msgs := z.messages()
+		return len(msgs) == 1 && msgs[0] == failNote[errInterrupted]
+	})
+	waitReactionRemoved(t, z, interrupted.MessageID)
 
 	select {
 	case j := <-finished:
