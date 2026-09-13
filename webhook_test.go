@@ -208,12 +208,24 @@ func TestSendWebhookDisabled(t *testing.T) {
 	}
 }
 
-func TestHostPathPassesThroughForeignPaths(t *testing.T) {
+func TestHostPath(t *testing.T) {
 	cfg := webhookConfig("")
-	if got := hostPath(cfg, ""); got != "" {
-		t.Errorf("empty path = %q", got)
-	}
-	if got := hostPath(cfg, "/elsewhere/a.webm"); got != "/elsewhere/a.webm" {
-		t.Errorf("foreign path = %q", got)
+	trailing := cfg
+	trailing.DataDir = "/data/"
+
+	for _, tc := range []struct {
+		name     string
+		cfg      Config
+		in, want string
+	}{
+		{"under data dir", cfg, "/data/jobs/42/audio.webm", "/srv/capture/jobs/42/audio.webm"},
+		{"trailing slash on data dir", trailing, "/data/jobs/42/audio.webm", "/srv/capture/jobs/42/audio.webm"},
+		{"sibling directory", cfg, "/data-other/a.webm", "/data-other/a.webm"},
+		{"foreign path", cfg, "/elsewhere/a.webm", "/elsewhere/a.webm"},
+		{"empty", cfg, "", ""},
+	} {
+		if got := hostPath(tc.cfg, tc.in); got != tc.want {
+			t.Errorf("%s: hostPath(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
 	}
 }

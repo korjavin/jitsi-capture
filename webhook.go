@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -73,14 +74,19 @@ type finishedPayload struct {
 	Tracks       []Track  `json:"tracks,omitempty"`
 }
 
-// hostPath rebases a container path onto the host bind mount. Anything not
-// under DataDir is passed through untouched.
+// hostPath rebases a container path onto the host bind mount. filepath.Rel
+// cleans both sides, so a trailing slash on DATA_DIR is harmless and a sibling
+// such as /data-other is not mistaken for a child of /data; anything not under
+// DataDir is passed through untouched.
 func hostPath(cfg Config, p string) string {
-	rest, ok := strings.CutPrefix(p, cfg.DataDir)
-	if !ok {
+	if p == "" || cfg.HostDataDir == cfg.DataDir {
 		return p
 	}
-	return cfg.HostDataDir + rest
+	rel, err := filepath.Rel(cfg.DataDir, p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return p
+	}
+	return filepath.Join(cfg.HostDataDir, rel)
 }
 
 func buildPayload(cfg Config, job Job) finishedPayload {
