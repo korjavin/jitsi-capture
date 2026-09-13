@@ -40,8 +40,9 @@ type Runner struct {
 // disk — not merely until the child exits, so Stop can neither miss a job whose
 // child has not spawned yet nor return while a job.json still says "recording".
 type recording struct {
-	cmd  *exec.Cmd     // nil until the child has actually been started
-	done chan struct{} // closed once the job has been settled
+	cmd    *exec.Cmd     // nil until the child has actually been started
+	termed bool          // SIGTERM already sent; a second one skips finalization
+	done   chan struct{} // closed once the job has been settled
 }
 
 // nodeBin is the interpreter the recorder is launched with.
@@ -109,7 +110,9 @@ func (r *Runner) Start(job Job) error {
 func (r *Runner) run(job Job, rec *recording) {
 	defer func() {
 		r.mu.Lock()
-		delete(r.running, job.ID)
+		if r.running[job.ID] == rec { // a re-record may already have replaced it
+			delete(r.running, job.ID)
+		}
 		r.mu.Unlock()
 		close(rec.done)
 	}()
@@ -131,13 +134,14 @@ func (r *Runner) run(job Job, rec *recording) {
 		if err = cmd.Start(); err == nil {
 			r.mu.Lock()
 			rec.cmd = cmd
-			stopping := r.stopping
-			r.mu.Unlock()
-			if stopping {
-				// Stop ran between Start and here, so this child missed its
-				// signal round; send it now.
-				signalProcess(job.ID, cmd, syscall.SIGTERM)
+			if r.stopping {
+				// Stop ran between Start and here, so this child missed the
+				// signal round; send it now, still under the lock so it cannot
+				// also be signalled by Stop.
+				r.termLocked(job.ID, rec)
 			}
+			r.mu.Unlock()
+
 			tail = drainStderr(stderr, job.ID)
 			err = cmd.Wait()
 		}
@@ -218,7 +222,7 @@ func (r *Runner) Stop(grace time.Duration) {
 		return
 	}
 	slog.Info("stopping recorders", "count", len(recs), "grace", grace)
-	r.signalRunning(syscall.SIGTERM)
+	r.termRunning()
 
 	deadline := time.Now().Add(grace)
 	for _, rec := range recs {
@@ -228,18 +232,36 @@ func (r *Runner) Stop(grace time.Duration) {
 			slog.Warn("recorders did not stop within grace, killing")
 			// ponytail: killed children are left to settle on their own —
 			// blocking shutdown past the grace period is the worse failure.
-			r.signalRunning(syscall.SIGKILL)
+			r.killRunning()
 			return
 		}
 	}
 }
 
-// signalRunning sends sig to every child that has actually been started.
-func (r *Runner) signalRunning(sig os.Signal) {
+// termRunning asks every started child to finalize, at most once each: record.js
+// exits immediately on a second signal, skipping finalization and its JSON line.
+func (r *Runner) termRunning() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, rec := range r.running {
-		signalProcess(id, rec.cmd, sig)
+		r.termLocked(id, rec)
+	}
+}
+
+// termLocked must be called with r.mu held.
+func (r *Runner) termLocked(id string, rec *recording) {
+	if rec.termed || rec.cmd == nil {
+		return
+	}
+	rec.termed = true
+	signalProcess(id, rec.cmd, syscall.SIGTERM)
+}
+
+func (r *Runner) killRunning() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, rec := range r.running {
+		signalProcess(id, rec.cmd, syscall.SIGKILL)
 	}
 }
 
