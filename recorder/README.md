@@ -86,7 +86,12 @@ and the stdout JSON gains a `tracks` array with absolute paths:
   this track's recorder started, so a transcript of the track can be merged into
   the meeting timeline by adding the offset.
 * `ended_s` — when it stopped (the participant left, or the call ended).
-* `speakers.jsonl` is the fallback for the consumer when a track is missing.
+* `speakers.jsonl` is the fallback for the consumer when a track is missing. It
+  is not named in the stdout JSON: it lives in the directory of any
+  `tracks[].path`, which the caller service places at
+  `dirname(audio_path)/tracks`.
+* The directory is emptied at startup, the same truncate semantics `--out` has,
+  so re-recording a job cannot append this call onto the previous one.
 
 How it works: the same 2 s poll walks Jitsi's redux
 `features/base/tracks` for remote audio tracks, and pipes each one through a
@@ -100,6 +105,13 @@ carries strings only) and are appended to the file as they arrive — a chunked
 MediaRecorder WebM stays playable that way, the first chunk carries the header,
 so **do not re-mux**.
 
+A track only ends when its owner leaves the room. If the track itself
+disappears — a mute, a P2P/bridge switch, a renegotiation — the MediaRecorder
+keeps running and the new stream is swapped in underneath it, so the gap stays
+in the file as silence and `offset_s` remains valid for the whole track. That
+matters: a file whose gaps were cut out would put every later word early by the
+length of the gap, which is exactly what merge-by-offset cannot survive.
+
 Known limits:
 
 * Somebody who rejoins gets a new Jitsi participant id, and therefore a second
@@ -107,7 +119,9 @@ Known limits:
 * A participant who joined muted has no audio track yet — the poll picks them up
   when one appears, and their `offset_s` reflects that later start.
 * Per-participant capture is best-effort: if it cannot be set up, the failure is
-  logged and the mixed recording continues alone.
+  logged and the mixed recording continues alone. A participant whose recorder
+  cannot be attached is skipped for the rest of the call rather than retried
+  every poll, which would leak audio nodes until the renderer died.
 
 ## Environment
 

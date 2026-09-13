@@ -165,6 +165,7 @@ function pollTracks(startedAtMs, stop) {
   const st = (window.__jc = window.__jc || {
     active: new Map(),
     names: new Map(),
+    failed: new Set(),
     events: [],
     dominant: null,
     ctx: null,
@@ -210,12 +211,13 @@ function pollTracks(startedAtMs, stop) {
   }
 
   for (const [id, s] of streams) {
-    if (st.active.has(id)) continue;
+    if (st.active.has(id) || st.failed.has(id)) continue;
+    let src = null;
     const started = read(() => {
       if (!st.ctx) st.ctx = new (window.AudioContext || window.webkitAudioContext)();
       // Needs --autoplay-policy=no-user-gesture-required, or it stays suspended.
       if (st.ctx.state === 'suspended') st.ctx.resume();
-      const src = st.ctx.createMediaStreamSource(s);
+      src = st.ctx.createMediaStreamSource(s);
       // Recording the remote track directly would stall the MediaRecorder clock
       // while the participant is muted; the AudioContext hop keeps it running.
       // Never connect to ctx.destination — that would echo into the tab capture.
@@ -236,12 +238,38 @@ function pollTracks(startedAtMs, stop) {
           .catch(() => {});
       };
       rec.start(1000);
-      st.active.set(id, { rec, src });
+      st.active.set(id, { rec, src, dest, stream: s });
       return true;
     }, false);
-    if (started) st.events.push({ type: 'start', id, name: nameOf(id), t: at() });
+    if (started) {
+      st.events.push({ type: 'start', id, name: nameOf(id), t: at() });
+    } else {
+      // One attempt per participant: retrying every 2 s would leak a connected
+      // node pair each time, and an out-of-memory renderer would take the mixed
+      // recording down with it.
+      st.failed.add(id);
+      read(() => src.disconnect());
+    }
   }
-  for (const id of [...st.active.keys()]) if (!streams.has(id)) end(id);
+
+  // A track that disappears while its owner is still in the room (a mute, a
+  // P2P/bridge switch, a renegotiation) must not end the recording: the
+  // MediaRecorder keeps running on the AudioContext, so the gap stays in the
+  // file as silence and offset_s remains valid for the whole track.
+  const inRoom = read(() => state()['features/base/participants'].remote, null);
+  for (const [id, a] of [...st.active]) {
+    const s = streams.get(id);
+    if (s && s !== a.stream) {
+      read(() => {
+        a.src.disconnect();
+        a.src = st.ctx.createMediaStreamSource(s);
+        a.src.connect(a.dest);
+        a.stream = s;
+      });
+    } else if (!s && (!inRoom || !inRoom.has(id))) {
+      end(id);
+    }
+  }
 
   // A display name often lands after the track does; report it when it changes.
   for (const id of st.active.keys()) {
@@ -347,11 +375,17 @@ async function setupTracks(page, tracksDir, startedAt) {
   const dir = path.resolve(tracksDir);
   const tracks = new Map();
   try {
+    // Truncate semantics, like --out: a re-recorded job reuses its directory,
+    // and appending onto the previous run's files would glue two calls together.
+    fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
     await page.exposeFunction('__trackChunk', (id, b64) => {
       try {
         // A chunked MediaRecorder WebM stays playable appended chunk by chunk —
         // the first one carries the header. Do not re-mux.
+        // ponytail: synchronous, so concurrent chunks cannot interleave inside
+        // one file; if N participants ever make this block the mixed write, the
+        // upgrade is a per-file async queue, not plain fs.appendFile.
         fs.appendFileSync(trackFile(dir, id), Buffer.from(b64, 'base64'));
       } catch (e) {
         log(`track write failed: ${scrub(e.message)}`);
@@ -364,7 +398,12 @@ async function setupTracks(page, tracksDir, startedAt) {
   const speakersPath = path.join(dir, 'speakers.jsonl');
   const pump = async (stop) => {
     try {
-      const events = await page.evaluate(pollTracks, startedAt, !!stop);
+      // Bounded: a wedged renderer must not hang the finalization path, where
+      // the JSON line and the exit code are still waiting to be produced.
+      const events = await Promise.race([
+        page.evaluate(pollTracks, startedAt, !!stop),
+        sleep(POLL_MS).then(() => []),
+      ]);
       const lines = toJsonl(applyTrackEvents(tracks, events, dir));
       if (lines) fs.appendFileSync(speakersPath, lines);
     } catch (e) {

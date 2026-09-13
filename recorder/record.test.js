@@ -105,8 +105,17 @@ test('shouldStop prefers max_duration over empty_room when both fire', () => {
 
 // --- per-participant tracks (--tracks-dir) ----------------------------------
 
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
-const { trackFile, applyTrackEvents, toJsonl, manifestRow, resultLine } = require('./record.js');
+const {
+  trackFile,
+  applyTrackEvents,
+  toJsonl,
+  manifestRow,
+  resultLine,
+  setupTracks,
+} = require('./record.js');
 
 test('parseArgs leaves tracksDir unset without the flag, and takes it with', () => {
   assert.ok(!('tracksDir' in parseArgs(MIN)), 'the key must be absent, not empty');
@@ -245,4 +254,64 @@ test('resultLine still emits an empty tracks array when nobody was recorded', ()
     resultLine({ out: '/d/a.webm', durationS: 1, reason: 'signal', participants: [], tracks: [] })
   );
   assert.deepStrictEqual(parsed.tracks, []);
+});
+
+// setupTracks against a fake page: no browser, no network. `evaluate` stands in
+// for pollTracks and replays queued event batches.
+const fakePage = (batches) => ({
+  exposeFunction: async () => {},
+  evaluate: async () => batches.shift() ?? [],
+});
+
+test('setupTracks stays out of the way without --tracks-dir', async () => {
+  assert.strictEqual(await setupTracks(fakePage([]), '', Date.now()), null);
+  assert.strictEqual(await setupTracks(fakePage([]), undefined, Date.now()), null);
+});
+
+test('setupTracks writes the manifests and clears a previous run', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tracks-'));
+  // Leftovers from an earlier recording of the same job must not survive: the
+  // chunk writer appends, so a stale file would glue two calls together.
+  fs.writeFileSync(path.join(dir, 'p1.webm'), 'from the previous run');
+  fs.writeFileSync(path.join(dir, 'speakers.jsonl'), '{"t_s":0,"id":"old","name":"Old"}\n');
+
+  const cap = await setupTracks(
+    fakePage([
+      [
+        { type: 'start', id: 'p1', name: 'First', t: 1 },
+        { type: 'speaker', id: 'p1', name: 'First', t: 1.5 },
+      ],
+      [{ type: 'start', id: 'p2', name: 'Second', t: 4 }],
+      [{ type: 'end', id: 'p1', t: 9 }],
+    ]),
+    dir,
+    Date.now()
+  );
+  assert.ok(cap, 'setupTracks returned null');
+  assert.ok(!fs.existsSync(path.join(dir, 'p1.webm')), 'stale track file survived');
+
+  await cap.pump(false);
+  const list = await cap.finish();
+
+  assert.deepStrictEqual(
+    list.map((t) => [t.id, t.name, t.offset_s, t.ended_s]),
+    [
+      ['p1', 'First', 1, 9],
+      ['p2', 'Second', 4, 4],
+    ]
+  );
+  assert.deepStrictEqual(
+    fs
+      .readFileSync(path.join(dir, 'tracks.jsonl'), 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map(JSON.parse),
+    [
+      { id: 'p1', name: 'First', offset_s: 1, ended_s: 9 },
+      { id: 'p2', name: 'Second', offset_s: 4, ended_s: 4 },
+    ]
+  );
+  assert.deepStrictEqual(fs.readFileSync(path.join(dir, 'speakers.jsonl'), 'utf8'),
+    '{"t_s":1.5,"id":"p1","name":"First"}\n');
+  fs.rmSync(dir, { recursive: true, force: true });
 });
