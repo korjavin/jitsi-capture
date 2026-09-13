@@ -139,6 +139,12 @@ function readJitsiState() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
 
+/**
+ * Error messages from puppeteer quote the URL they failed on ("net::ERR_… at
+ * https://…#…"), which may carry a JWT or a room password. Never log one raw.
+ */
+const scrub = (msg) => String(msg).replace(/https?:\/\/\S+/g, '<url>');
+
 async function main(argv) {
   let opts;
   try {
@@ -175,6 +181,11 @@ async function main(argv) {
       headless: 'new',
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'],
+      // Puppeteer's own handlers would kill Chromium (and exit 130 on SIGINT)
+      // before we finalize the file. Shutdown is onSignal's job.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
     });
     page = await browser.newPage();
     log(`joining room ${roomName(opts.url)} as ${opts.displayName}`);
@@ -183,7 +194,7 @@ async function main(argv) {
       timeout: 60000,
     });
   } catch (e) {
-    log(`browser launch/page failure: ${e.message}`);
+    log(`browser launch/page failure: ${scrub(e.message)}`);
     if (browser) await browser.close().catch(() => {});
     return 4;
   }
@@ -202,7 +213,7 @@ async function main(argv) {
       try {
         state = await page.evaluate(readJitsiState);
       } catch (e) {
-        log(`state probe failed: ${e.message}`);
+        log(`state probe failed: ${scrub(e.message)}`);
         state = { joined: false, knocking: false, membersCount: 0 };
       }
       const phase = state.joined ? 'joined' : state.knocking ? 'waiting_in_lobby' : 'waiting';
@@ -224,13 +235,19 @@ async function main(argv) {
     // --- record phase -----------------------------------------------------
     const stream = await getStream(page, { audio: true, video: false });
     const file = fs.createWriteStream(opts.out);
+    // An unhandled 'error' here (cannot open, disk full) would crash the process
+    // with exit 1, skipping cleanup and the contract's exit codes.
+    let fileError = null;
+    file.on('error', (e) => {
+      fileError = e;
+    });
     stream.pipe(file);
     const startedAt = Date.now();
     log(`recording -> ${opts.out}`);
 
     let aloneSince = null;
     const participants = new Set(); // insertion order == first-seen order
-    while (!reason) {
+    while (!reason && !fileError) {
       await sleep(POLL_MS);
       let membersCount = 0; // page gone == nobody left to record
       try {
@@ -238,7 +255,7 @@ async function main(argv) {
         membersCount = state.membersCount;
         for (const name of state.participants) participants.add(name);
       } catch (e) {
-        log(`state probe failed: ${e.message}`);
+        log(`state probe failed: ${scrub(e.message)}`);
       }
       const next = shouldStop({
         membersCount,
@@ -253,13 +270,21 @@ async function main(argv) {
     }
 
     const durationS = (Date.now() - startedAt) / 1000;
-    log(`stopping: ${reason}`);
+    log(`stopping: ${fileError ? 'write error' : reason}`);
     await stream.stop().catch(() => {});
-    await Promise.race([once(file, 'finish'), sleep(FLUSH_MS)]);
-    if (!file.writableFinished) {
-      stream.unpipe(file);
-      file.end();
-      await Promise.race([once(file, 'finish'), sleep(FLUSH_MS)]);
+    const flushed = () => Promise.race([once(file, 'finish').catch(() => {}), sleep(FLUSH_MS)]);
+    if (!fileError) {
+      await flushed();
+      if (!file.writableFinished) {
+        // The extension's websocket never closed; end the file ourselves.
+        stream.unpipe(file);
+        file.end();
+        await flushed();
+      }
+    }
+    if (fileError) {
+      log(`output write failed: ${scrub(fileError.message)}`);
+      return 5;
     }
 
     const size = fs.statSync(opts.out, { throwIfNoEntry: false })?.size ?? 0;
