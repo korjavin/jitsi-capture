@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,27 +30,44 @@ const (
 	spikeJoinTimeoutS   = 300 // lobby wait, passed to the script as --join-timeout
 	spikeSlackS         = 90  // browser launch + shutdown on top of join + record
 	spikeLineMax        = 600 // per posted line; 15 lines + header stay under Zulip's 10k limit
+	spikeCaptionLines   = 20  // caption lines quoted in the DM; the rest is in captions.jsonl
+	spikeCaptionMax     = 300 // per quoted caption line
 )
 
-var spikeRe = regexp.MustCompile(`^meet-spike\s+<?(https://meet\.google\.com/[A-Za-z0-9\-]+)>?(?:\s+seconds=(\d+))?$`)
+var (
+	spikeRe     = regexp.MustCompile(`^meet-spike\s+<?(https://meet\.google\.com/[A-Za-z0-9\-]+)>?((?:\s+\S+)*)$`)
+	spikeLangRe = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`) // the script's --lang check
+)
 
-// parseSpike reads "meet-spike <url> [seconds=N]". seconds defaults to 90 and is
-// capped at 600. The URL is cut at the meeting code, so no query string reaches
-// the script.
-func parseSpike(content string) (url string, seconds int, ok bool) {
+// parseSpike reads "meet-spike <url> [seconds=N] [lang=<code>]", options in any
+// order. seconds defaults to 90 and is capped at 600; lang (the Meet caption
+// language, e.g. en-US) defaults to Meet's own. The URL is cut at the meeting
+// code, so no query string reaches the script.
+func parseSpike(content string) (url string, seconds int, lang string, ok bool) {
 	m := spikeRe.FindStringSubmatch(strings.TrimSpace(content))
 	if m == nil {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	seconds = spikeDefaultSeconds
-	if m[2] != "" {
-		n, err := strconv.Atoi(m[2])
-		if err != nil || n < 1 {
-			return "", 0, false
+	for _, opt := range strings.Fields(m[2]) {
+		k, v, _ := strings.Cut(opt, "=")
+		switch k {
+		case "seconds":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return "", 0, "", false
+			}
+			seconds = min(n, spikeMaxSeconds)
+		case "lang":
+			if !spikeLangRe.MatchString(v) {
+				return "", 0, "", false
+			}
+			lang = v
+		default:
+			return "", 0, "", false
 		}
-		seconds = min(n, spikeMaxSeconds)
 	}
-	return m[1], seconds, true
+	return m[1], seconds, lang, true
 }
 
 type spikeZulip interface {
@@ -79,10 +97,10 @@ func newSpike(ctx, bg context.Context, cfg Config, z spikeZulip) *Spike {
 // Handle answers one "meet-spike ..." DM. It never blocks on the child.
 func (s *Spike) Handle(m Message) {
 	to := Job{DMUserID: m.SenderID}
-	url, seconds, ok := parseSpike(m.Content)
+	url, seconds, lang, ok := parseSpike(m.Content)
 	if !ok {
 		s.async(func() {
-			s.reply(to, "usage: `meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N]` (default 90, max 600)")
+			s.reply(to, "usage: `meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N] [lang=en-US]` (seconds: default 90, max 600; lang: Meet caption language, default Meet's)")
 		})
 		return
 	}
@@ -93,7 +111,11 @@ func (s *Spike) Handle(m Message) {
 	s.async(func() {
 		defer s.busy.Store(false)
 		s.reply(to, fmt.Sprintf("meet-spike: joining as guest for %d s, admit me from the lobby (I wait up to %d s).", seconds, spikeJoinTimeoutS))
-		s.reply(to, s.run(url, seconds))
+		report, captions := s.run(url, seconds, lang)
+		s.reply(to, report)
+		if captions != "" {
+			s.reply(to, captions)
+		}
 	})
 }
 
@@ -128,22 +150,28 @@ func (s *Spike) reply(to Job, text string) {
 	}
 }
 
-// run executes the script and returns the report to post.
-func (s *Spike) run(url string, seconds int) string {
+// run executes the script and returns the report to post plus, when the run
+// got that far, a second message with the captions (separate: the report alone
+// is already close to Zulip's 10k-character limit).
+func (s *Spike) run(url string, seconds int, lang string) (report, captions string) {
 	outDir := filepath.Join(s.dataDir, "spike", time.Now().UTC().Format("20060102-150405"))
 	// ponytail: spike dirs are not swept by retention; delete them by hand.
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return "meet-spike failed: " + err.Error()
+		return "meet-spike failed: " + err.Error(), ""
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(seconds+spikeJoinTimeoutS+spikeSlackS)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, nodeBin, s.script, url,
+	args := []string{s.script, url,
 		"--seconds", strconv.Itoa(seconds),
 		"--join-timeout", strconv.Itoa(spikeJoinTimeoutS),
 		"--captions",
 		"--name", s.name,
 		"--out-dir", outDir,
-	)
+	}
+	if lang != "" {
+		args = append(args, "--lang", lang)
+	}
+	cmd := exec.CommandContext(ctx, nodeBin, args...)
 	// SIGINT is the script's clean stop: it keeps the audio recorded so far.
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	cmd.WaitDelay = 20 * time.Second
@@ -159,27 +187,59 @@ func (s *Spike) run(url string, seconds int) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "meet-spike finished, exit code %d (0 recorded, 2 bad args, 3 never admitted, 4 error, -1 timeout/shutdown)\n```text\n%s\n```\n", code, spikeLines(stderr.String()))
-	b.WriteString(s.uploadAudio(filepath.Join(outDir, "mixed.webm")))
-	return b.String()
+	b.WriteString(s.upload("Audio", filepath.Join(outDir, "mixed.webm"), "meet-spike.webm"))
+	return b.String(), s.captionsReport(filepath.Join(outDir, "captions.jsonl"))
 }
 
-func (s *Spike) uploadAudio(path string) string {
+// upload posts one file of the run to Zulip and returns the line for the DM.
+func (s *Spike) upload(what, path, name string) string {
 	f, err := os.Open(path)
 	if err != nil {
-		return "No audio file."
+		return "No " + strings.ToLower(what) + " file."
 	}
 	defer f.Close()
 	if fi, err := f.Stat(); err != nil || fi.Size() == 0 {
-		return "Audio file is empty."
+		return what + " file is empty."
 	}
 	ctx, cancel := context.WithTimeout(s.bg, 2*time.Minute)
 	defer cancel()
-	link, err := s.z.Upload(ctx, "meet-spike.webm", f)
+	link, err := s.z.Upload(ctx, name, f)
 	if err != nil {
-		slog.Error("meet-spike audio upload", "err", err)
-		return "Audio upload failed: " + err.Error()
+		slog.Error("meet-spike upload", "file", name, "err", err)
+		return what + " upload failed: " + err.Error()
 	}
-	return "Audio: [meet-spike.webm](" + link + ")"
+	return what + ": [" + name + "](" + link + ")"
+}
+
+// captionsReport renders the first spikeCaptionLines lines of captions.jsonl as
+// "speaker: text" plus a link to the whole file.
+func (s *Spike) captionsReport(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "Captions: no captions file."
+	}
+	var lines []string
+	n := 0
+	for _, l := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var c struct{ Speaker, Text string }
+		if json.Unmarshal([]byte(l), &c) != nil || c.Text == "" {
+			continue
+		}
+		n++
+		if len(lines) < spikeCaptionLines {
+			line := c.Speaker + ": " + c.Text
+			if len(line) > spikeCaptionMax {
+				line = strings.ToValidUTF8(line[:spikeCaptionMax], "") + "…"
+			}
+			lines = append(lines, line)
+		}
+	}
+	if n == 0 {
+		return "Captions: none captured."
+	}
+	return fmt.Sprintf("Captions: %d lines, the first %d:\n```text\n%s\n```\n%s", n, len(lines),
+		strings.ReplaceAll(strings.Join(lines, "\n"), "```", "'''"),
+		s.upload("Captions", path, "captions.jsonl"))
 }
 
 // spikeLines keeps the lines of the script's log the go/no-go report needs:

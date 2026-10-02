@@ -64,12 +64,15 @@ request, so the recording starts right away — no 🎙️ step, 🔴 goes on th
 Failure notes and the "transcript ready" message come back in the same DM.
 
 **Google Meet spike (diagnostic).** DM the bot
-`meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N]` (default 90,
-max 600) to run [`recorder/spike/meet-spike.js`](recorder/spike/README.md) from
+`meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N] [lang=<code>]`
+(default 90, max 600) to run [`recorder/spike/meet-spike.js`](recorder/spike/README.md) from
 the deployed container: it joins as an anonymous guest (headless, captions on),
 waits up to 300 s in the lobby for someone to admit it, then records N seconds.
+`lang=` (e.g. `lang=de-DE`) tries to set Meet's caption language; Meet captions
+one spoken language per meeting, so mixed-language calls caption badly.
 The bot replies at once, then posts the `STATE`/`media`/`names`/`SUMMARY` lines
-and a link to the mixed audio into the same DM. One run at a time — a second
+and a link to the mixed audio into the same DM, then a third message with the
+first 20 caption lines (`speaker: text`) and a link to `captions.jsonl`. One run at a time — a second
 request gets `busy`. Files stay under `DATA_DIR/spike/<timestamp>/` (not swept
 by retention). Guest mode only: a signed-in bot account needs a hand sign-in a
 headless container cannot do.

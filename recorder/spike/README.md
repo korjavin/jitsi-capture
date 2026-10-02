@@ -10,12 +10,30 @@ with Puppeteer Chromium and logs what the go/no-go report needs:
   `blocked`, `invalid`, `removed`, `ended`, `signin`, `unknown`), with the
   phrase that matched and the first 400 characters of page text;
 - every incoming WebRTC track (`rtc` lines) and, every 5 s while in the call,
-  the live remote audio track count plus per-SSRC `audioLevel` (`media` lines).
-  This shows whether Meet sends ~3 rotating "loudest speaker" streams;
-- visible participant names, by three selector guesses, plus caption text with
-  `--captions` (`names` lines);
+  the live remote audio track count plus, per inbound SSRC, `lvl` (audioLevel),
+  `nrg` (totalAudioEnergy), `smp` (totalSamplesReceived) and `kB` (`media`
+  lines). Also how many of Meet's `<audio>` elements and of the script's own
+  are playing (`meetEls`/`ourEls`), `recRms` (peak RMS of what MediaRecorder
+  actually records since the last line) and the saved caption count. Reading
+  them: `kB` grows but `smp` stays 0 = nothing pulls (decodes) the track;
+  `smp` grows with `nrg` 0 = Meet sends silence; `nrg` grows but `recRms` is 0 =
+  the page-side mix is silent;
+- visible participant names, by three selector guesses, plus caption stats with
+  `--captions` (`names` lines: `on`, which parse `strategy` worked, `blocks`
+  on screen, `saved` utterances);
+- with `--captions`: captions turned on (toolbar button, then the `c`
+  shortcut), each finished utterance saved once to `captions.jsonl` as
+  `{"ts","speaker","text"}` (Meet rewrites the last line while someone talks;
+  a line is saved once it stops changing or leaves the screen). If the
+  captions region has text but nothing parses, one `markup sample` log line
+  shows its HTML for fixing the selectors. `--lang <code>` tries to pick the
+  caption language in Meet's settings (`captions lang:` lines). **Meet
+  captions one spoken language per meeting**: a mixed-language call is
+  captioned as if everything were in that one language;
 - N seconds of all remote audio, mixed in the page and recorded with
-  MediaRecorder, in `mixed.webm`.
+  MediaRecorder, in `mixed.webm`. Every remote audio track is also played by a
+  detached `<audio>` element: Chromium leaves a remote WebRTC track that only
+  feeds WebAudio undecoded, which recorded digital silence in run 1.
 
 The bot joins **without microphone or camera**: the script denies both
 permissions, so it cannot send audio into the call.
@@ -23,6 +41,7 @@ permissions, so it cannot send audio into the call.
 Everything goes to `--out-dir` (default `./meet-spike-out`):
 - `spike.log`: the log;
 - `mixed.webm`: the audio;
+- `captions.jsonl`: the captions (with `--captions`);
 - a `NNNN-<state>.png` screenshot and a `.txt` page-text dump at every state
   change, and one every 30 s in the call.
 
