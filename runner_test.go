@@ -39,7 +39,7 @@ type fakeZulip struct {
 	err          error
 	delay        time.Duration // stands in for a slow Zulip during shutdown
 	beforeRemove func(int64)   // runs at the start of RemoveReaction, with the message id
-	beforeSend   func()        // runs at the start of SendMessage
+	beforeSend   func()        // runs at the start of Reply
 }
 
 func (f *fakeZulip) AddReaction(_ context.Context, msgID int64, emoji string) error {
@@ -60,13 +60,13 @@ func (f *fakeZulip) RemoveReaction(_ context.Context, msgID int64, emoji string)
 	return f.err
 }
 
-func (f *fakeZulip) SendMessage(_ context.Context, stream, topic, content string) error {
+func (f *fakeZulip) Reply(_ context.Context, job Job, content string) error {
 	if f.beforeSend != nil {
 		f.beforeSend()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, zulipCall{kind: callMessage, stream: stream, topic: topic, content: content})
+	f.calls = append(f.calls, zulipCall{kind: callMessage, stream: job.Stream, topic: job.Topic, content: content})
 	return f.err
 }
 

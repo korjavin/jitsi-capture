@@ -17,8 +17,9 @@ type Job struct {
 	MessageID     int64      `json:"message_id"`
 	Stream        string     `json:"stream"`
 	Topic         string     `json:"topic"`
-	JitsiURL      string     `json:"jitsi_url"` // room URL only — never tokens/passwords
-	State         string     `json:"state"`     // recording | finished | failed
+	DMUserID      int64      `json:"dm_user_id,omitempty"` // set for a DM-started job; replies go back to this user
+	JitsiURL      string     `json:"jitsi_url"`            // room URL only — never tokens/passwords
+	State         string     `json:"state"`                // recording | finished | failed
 	Error         string     `json:"error,omitempty"`
 	StartedAt     time.Time  `json:"started_at"`
 	EndedAt       *time.Time `json:"ended_at,omitempty"`

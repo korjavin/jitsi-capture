@@ -21,7 +21,7 @@ const maxNotifyBody = 1 << 20
 type server struct {
 	secret  string
 	loadJob func(id string) (Job, error)
-	send    func(ctx context.Context, stream, topic, content string) error
+	send    func(ctx context.Context, job Job, content string) error
 }
 
 func (s *server) handler() http.Handler {
@@ -65,7 +65,7 @@ func (s *server) notify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The content itself is user-visible text, never logged at info level.
-	if err := s.send(r.Context(), job.Stream, job.Topic, req.Content); err != nil {
+	if err := s.send(r.Context(), job, req.Content); err != nil {
 		slog.Error("notify: posting to zulip", "job", req.ID, "err", err)
 		http.Error(w, "cannot post to zulip", http.StatusBadGateway)
 		return

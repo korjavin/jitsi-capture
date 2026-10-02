@@ -59,7 +59,11 @@ accidental recordings of short calls.
    indicator is removed and the webhook goes out. The "transcript ready" message
    arrives later, in the same topic, via `POST /notify` from downstream.
 
-Failures are reported as one English line in the job's topic:
+**By direct message.** Anyone can DM the bot a Jitsi link: that is an explicit
+request, so the recording starts right away — no 🎙️ step, 🔴 goes on the DM.
+Failure notes and the "transcript ready" message come back in the same DM.
+
+Failures are reported as one English line in the job's topic (or DM):
 
 | cause | message |
 |---|---|
@@ -143,6 +147,8 @@ The signature is `HMAC-SHA256(raw body, WEBHOOK_SECRET)`, lowercase hex. Body:
 `audio_path` (and every `tracks[].path`) is a **host** path — `DATA_DIR` rebased
 onto `HOST_DATA_DIR` — so the receiving service reads the file through its own
 bind mount. `tracks` is omitted when the recorder produced no per-speaker files.
+A job started by DM has empty `stream` and `topic` and carries
+`"dm_user_id": <sender's Zulip user id>` instead (omitted for stream jobs).
 
 Verifying the signature:
 
@@ -169,7 +175,7 @@ Content-Type: application/json
 ```
 
 Same HMAC over the raw body, same `WEBHOOK_SECRET`. `content` is posted verbatim
-into the stream/topic of job `id`. Responses: `200 {"status":"ok"}` ·
+into the stream/topic of job `id` (or the DM, for a DM-started job). Responses: `200 {"status":"ok"}` ·
 `400` missing fields · `401` bad signature · `404` unknown job · `502` Zulip
 refused the message.
 

@@ -243,6 +243,34 @@ func TestZulipSendMessage(t *testing.T) {
 	}
 }
 
+func TestZulipReply(t *testing.T) {
+	tests := []struct {
+		name string
+		job  Job
+		want map[string]string
+	}{
+		{"stream job", Job{Stream: testStream, Topic: testTopic},
+			map[string]string{"type": "stream", "to": `"` + testStream + `"`, "topic": testTopic}},
+		{"dm job", Job{DMUserID: 42},
+			map[string]string{"type": "private", "to": "[42]", "topic": ""}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			z, s := newZulipServer(t, func(w http.ResponseWriter, r *http.Request, _ url.Values) { ok(w, "") })
+			if err := z.Reply(context.Background(), tc.job, "hello"); err != nil {
+				t.Fatalf("Reply() error: %v", err)
+			}
+			req := s.requests()[0]
+			tc.want["content"] = "hello"
+			for k, want := range tc.want {
+				if got := req.form.Get(k); got != want {
+					t.Errorf("form %s = %q; want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
 // Zulip reads a bare integer "to" as a channel id, so a stream whose name looks
 // like a number must go over as a JSON string or the message is misrouted.
 func TestZulipSendMessageQuotesNumericStreamNames(t *testing.T) {
