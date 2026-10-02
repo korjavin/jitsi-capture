@@ -52,8 +52,9 @@ test('meetingCode logs the code, never the rest of the URL', () => {
 });
 
 /** Run the page-side readState against a stubbed DOM. */
-function stateOf(text, { leave = false, captions = '' } = {}) {
+function stateOf(text, { leave = false, tiles = false, captions = '' } = {}) {
   const els = {
+    '[data-participant-id]': tiles ? {} : null,
     '[role="region"][aria-label*="aption" i]': captions ? { innerText: captions } : null,
     '[aria-label*="Leave call" i]': leave ? {} : null,
   };
@@ -80,6 +81,10 @@ test('readState classifies the Meet screens', () => {
   assert.strictEqual(stateOf("You've been removed from the meeting"), 'removed');
   assert.strictEqual(stateOf('The call has ended. Return to home screen'), 'ended');
   assert.strictEqual(stateOf('Alice: the call has ended', { leave: true, captions: 'Alice: the call has ended' }), 'admitted', 'caption speech is ignored');
+  assert.strictEqual(stateOf('Alice: the call has ended', { leave: true, tiles: true }), 'admitted', 'chat text in the call is ignored');
+  assert.strictEqual(stateOf("Alice You've been removed from the meeting", { leave: true, tiles: true }), 'admitted');
+  assert.strictEqual(stateOf("You've been removed from the meeting", { leave: true }), 'removed', 'a lingering Leave button without tiles');
+  assert.strictEqual(stateOf('Asking to be let in…', { leave: true, tiles: true }), 'lobby', 'a lobby self-preview tile');
   assert.strictEqual(stateOf('something else'), 'unknown');
 });
 
@@ -87,6 +92,7 @@ test('otherNames drops the bot and treats no tiles as unknown', () => {
   assert.deepStrictEqual(otherNames({ tiles: 3, names: ['Alice', 'NoteTaker', 'Bob (You)', 'Carol'], self: [] }, 'NoteTaker'), ['Alice', 'Carol']);
   assert.deepStrictEqual(otherNames({ tiles: 1, names: ['Meet Bot'], self: ['Meet Bot'] }, 'NoteTaker'), []);
   assert.strictEqual(otherNames({ tiles: 0, names: [], self: [] }, 'NoteTaker'), null);
+  assert.strictEqual(otherNames({ tiles: 2, names: [], self: [] }, 'NoteTaker'), null, 'tiles without name text');
 });
 
 test('meetShouldStop: empty grace on a readable empty roster, never on an unknown one', () => {
@@ -287,7 +293,7 @@ test('end to end: stops on its own once the room is empty', { skip, timeout: 120
   const restore = fakeMeet();
   try {
     const out = path.join(dir, 'audio.wav');
-    const { code, stdout } = await runMain(['--url', `${URL}?aliceLeavesAfter=3`, '--out', out, '--join-timeout', '60', '--empty-grace', '2']);
+    const { code, stdout } = await runMain(['--url', `${URL}?aliceLeavesAfter=8`, '--out', out, '--join-timeout', '60', '--empty-grace', '2']);
     assert.strictEqual(code, 0);
     const res = JSON.parse(stdout);
     assert.strictEqual(res.reason, 'empty_room');

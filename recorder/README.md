@@ -254,7 +254,7 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   until admitted or `--join-timeout`. Nobody admitting it at all is exit 3.
 * **Stopping**: like `record.js`, plus `ended`/`removed`. The empty-room rule
   counts the participant names visible on the video tiles (and the people
-  panel when open), bot excluded; when no tile can be read at all the roster
+  panel when open), bot excluded; when no tile or no name can be read the roster
   counts as unknown, never as empty, so a Meet markup change cannot cut a call
   short — it falls back to `--max-duration` instead.
 

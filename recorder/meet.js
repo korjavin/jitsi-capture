@@ -102,8 +102,8 @@ function lockMedia() {
   };
 }
 
-/** Classify the page: {state, why}. Order matters: terminal states win over
- * "the Leave call button is still in the DOM". */
+/** Classify the page: {state, why}. Order matters: in the call, terminal
+ * phrases are ignored; without tiles they win over a lingering Leave button. */
 function readState() {
   // Captions are participant speech: "the call has ended" said aloud must not end the run.
   const cap = document.querySelector('[role="region"][aria-label*="aption" i]');
@@ -115,8 +115,14 @@ function readState() {
     return m ? m[0] : null;
   };
   const leave = !!document.querySelector('[aria-label*="Leave call" i]');
+  const tiles = !!document.querySelector('[data-participant-id]');
   const rules = [
     ['signin', () => (/accounts\.google\.com/.test(location.host) ? 'sign-in page' : null)],
+    // The lobby shows a Leave call button too: its own phrases win over it.
+    ['lobby', () => has(/please wait until a meeting host brings you into the call|asking to be let in|you'll join the call when someone lets you in/i)],
+    // In the call (Leave button + video tiles), page text is chat and names —
+    // participant-controlled, so "the call has ended" typed in chat must not end the run.
+    ['admitted', () => (leave && tiles ? 'Leave call button + tiles' : null)],
     // Nobody answered the knock (nobody in the meeting yet): re-knock.
     ['unanswered', () => has(/no one responded to your request/i)],
     ['denied', () => has(/denied your request|someone in the call denied|you can't join this call/i)],
@@ -124,8 +130,6 @@ function readState() {
     ['invalid', () => has(/check your meeting code|invalid video call name/i)],
     ['removed', () => has(/you've been removed from the meeting|removed you from the meeting/i)],
     ['ended', () => has(/you left the meeting|the call has ended|call ended|meeting has ended|return to home screen/i)],
-    // The lobby shows a Leave call button too: its own phrases win over it.
-    ['lobby', () => has(/please wait until a meeting host brings you into the call|asking to be let in|you'll join the call when someone lets you in/i)],
     ['admitted', () => (leave ? 'Leave call button' : null)],
     // Weaker phrases ("X is asking to join" is also an in-call notice) only count without the button.
     ['lobby', () => has(/please wait until a meeting host|someone will let you in|waiting for the host|asking to join/i)],
@@ -190,9 +194,10 @@ function readNames() {
 
 // --- node side ----------------------------------------------------------------
 
-/** Names other than the bot's, or null when no tile is on screen (unknown). */
+/** Names other than the bot's, or null when the roster is unreadable — no
+ * tile on screen, or tiles without any name text (the bot's own included). */
 function otherNames({ tiles, names, self }, displayName) {
-  if (!tiles) return null;
+  if (!tiles || !names.length) return null;
   const me = new Set([displayName, ...self].map((s) => s.toLowerCase()));
   return names.filter((n) => !me.has(n.toLowerCase()) && !/\(you\)$/i.test(n) && !/^you$/i.test(n));
 }
