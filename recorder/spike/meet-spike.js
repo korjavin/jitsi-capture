@@ -307,15 +307,20 @@ function readCaptions() {
     name: txt(b.querySelector('.NWpY1d, .KcIKyf, .zs7s8d')),
     text: txt(b.querySelector('.ygicle, .bh44bd, .iTTPOb')),
   }));
-  if (!blocks.some((b) => b.name && b.text)) {
+  // Known blocks with a name count even while cleared (empty text): foldCaptions needs them.
+  if (!blocks.some((b) => b.name)) {
     strategy = 'structural';
     const cand = [...region.querySelectorAll('*')].filter((e) => {
       if (e.children.length < 2) return false;
       const name = (e.children[0].innerText || '').trim();
       return name && name.length <= 80 && !name.includes('\n') && txt(e).length > name.length;
     });
-    blocks = cand
-      .filter((e) => !cand.some((o) => o !== e && o.contains(e)))
+    // A wrapper with two or more candidate children is the caption list, not a
+    // turn; of the rest the outermost wins (a text div of several spans can
+    // pass the test inside its turn).
+    const turns = cand.filter((e) => [...e.children].filter((c) => cand.includes(c)).length < 2);
+    blocks = turns
+      .filter((e) => !turns.some((o) => o !== e && o.contains(e)))
       .map((e) => ({
         id: id(e),
         name: txt(e.children[0]),
@@ -324,7 +329,7 @@ function readCaptions() {
   }
   // Text-less blocks stay: a cleared block on screen differs from one that left (foldCaptions).
   // Region with text but nothing parsed: a markup sample to fix the selectors.
-  const sample = !blocks.some((b) => b.text) && txt(region) ? region.innerHTML.slice(0, 600) : null;
+  const sample = strategy === 'structural' && !blocks.some((b) => b.text) && txt(region) ? region.innerHTML.slice(0, 600) : null;
   return { region: true, strategy, blocks, sample };
 }
 
