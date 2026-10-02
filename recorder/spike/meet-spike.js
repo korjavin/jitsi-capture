@@ -317,6 +317,10 @@ async function main() {
     if (stop) process.exit(130);
     stop = 'signal';
     log('SIGINT — stopping (again to force)');
+    // A wedged await never reaches the cleanup. process.exit still runs
+    // Puppeteer's exit hook, which kills Chromium; a SIGKILL from the Go side
+    // (its WaitDelay is 20 s) would orphan it.
+    setTimeout(() => process.exit(130), 15000).unref();
   });
 
   const puppeteer = require('puppeteer');
