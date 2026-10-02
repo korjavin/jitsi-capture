@@ -179,6 +179,10 @@ A job started by DM has empty `stream` and `topic` and carries
 `"dm_user_id": <sender's Zulip user id>` instead (omitted for stream jobs).
 A Google Meet job adds `"source": "meet"` (omitted for Jitsi), keeps the meeting
 URL in `jitsi_url`, has no `tracks`, and its `audio_path` ends in `audio.wav`.
+It may also carry `"speaker_hints_path"` (host path; omitted when there is
+none, always for Jitsi): a JSONL file of Meet caption lines
+`{"offset_s", "speaker", "text"}`, `offset_s` in seconds from the start of
+`audio_path`, so the receiver can attribute transcript segments to speakers.
 
 Verifying the signature:
 
@@ -219,6 +223,7 @@ refused the message.
 DATA_DIR/jobs/<id>/job.json      # id = the Zulip message id
 DATA_DIR/jobs/<id>/audio.webm    # mixed conference audio (audio.wav for a Meet job)
 DATA_DIR/jobs/<id>/tracks/       # per-participant files, when available
+DATA_DIR/jobs/<id>/captions.jsonl  # Meet caption speaker hints, when any
 ```
 
 `job.json` carries `state` (`recording` | `finished` | `failed`), `error`,

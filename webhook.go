@@ -79,6 +79,7 @@ type finishedPayload struct {
 	Participants []string `json:"participants"`
 	CallbackURL  string   `json:"callback_url"`
 	Tracks       []Track  `json:"tracks,omitempty"`
+	SpeakerHints string   `json:"speaker_hints_path,omitempty"` // Meet: caption speaker timeline, JSONL {offset_s, speaker, text}
 }
 
 // hostPath rebases a container path onto the host bind mount. filepath.Rel
@@ -107,6 +108,7 @@ func buildPayload(cfg Config, job Job) finishedPayload {
 		JitsiURL:     job.JitsiURL,
 		Source:       job.Source,
 		AudioPath:    hostPath(cfg, job.AudioPath),
+		SpeakerHints: hostPath(cfg, job.CaptionsPath),
 		DurationS:    job.DurationS,
 		StartedAt:    job.StartedAt.Format(time.RFC3339),
 		Participants: job.Participants,

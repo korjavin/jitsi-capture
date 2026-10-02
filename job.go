@@ -28,7 +28,8 @@ type Job struct {
 	AudioPath     string     `json:"audio_path,omitempty"` // container path DATA_DIR/jobs/<id>/audio.webm (audio.wav for Meet)
 	Participants  []string   `json:"participants"`
 	WebhookSentAt *time.Time `json:"webhook_sent_at,omitempty"`
-	Tracks        []Track    `json:"tracks,omitempty"` // filled once the recorder emits per-participant audio
+	Tracks        []Track    `json:"tracks,omitempty"`        // filled once the recorder emits per-participant audio
+	CaptionsPath  string     `json:"captions_path,omitempty"` // Meet: caption speaker hints (JSONL), when captions produced any
 }
 
 // Track is one participant's audio within a job.

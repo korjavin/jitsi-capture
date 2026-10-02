@@ -227,7 +227,8 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   [--max-duration <sec, default 14400>] \
   [--empty-grace <sec, default 60>] \
   [--display-name <str, default NoteTaker>] \
-  [--tracks-dir <dir>]   # accepted and ignored
+  [--tracks-dir <dir>] \  # accepted and ignored
+  [--captions-out <path/captions.jsonl>]
 ```
 
 * **Same** exit codes (0 / 2 / 3 / 4 / 5), signals (`SIGTERM`/`SIGINT` stop
@@ -237,6 +238,8 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   Only the meeting code is logged, never the URL.
 * **stdout**: `{"out","duration_s","reason","participants"}` — never `tracks`:
   Meet sends a few mixed loudest-speaker streams, no per-participant audio.
+  Plus `"captions": "<path>"` when `--captions-out` was given and the file got
+  at least one line.
   `reason` is `empty_room` | `max_duration` | `signal` | `ended` (the meeting
   ended or the host ended it for everyone) | `removed` (the bot was removed).
   `duration_s` is the length of the audio in the WAV.
@@ -252,6 +255,14 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   one responded to your request". The bot re-knocks (reload + *Ask to join*)
   every 60 s, logging `state: waiting_in_lobby (no one responded; re-knock N)`,
   until admitted or `--join-timeout`. Nobody admitting it at all is exit 3.
+* **Speaker hints** (`--captions-out`): after admission the bot turns Meet's
+  live captions on (the toolbar button, else the `c` shortcut; visible to
+  participants) and writes each finished utterance as one JSON line
+  `{"offset_s": <seconds since the recording started>, "speaker": "<name as
+  Meet shows it>", "text": "<caption text>"}`; `offset_s` is monotonic, in
+  0.1 s steps. The caption language is left as the meeting has it: the text is
+  only a hint, the transcript comes from the audio. Captions that cannot be
+  turned on are logged and the recording goes on.
 * **Stopping**: like `record.js`, plus `ended`/`removed`. The empty-room rule
   counts the participant names visible on the video tiles (and the people
   panel when open), bot excluded; when no tile or no name can be read the roster
@@ -274,7 +285,8 @@ and `pulseaudio-utils` in the image. Page-side capture (WebAudio/MediaRecorder
 on the RTP tracks, tab capture) does not work on Meet.
 
 Every Meet DOM read and phrase lives in one page-side block in `meet.js`
-(`readState`, `prejoin`, `clickJoin`, `readNames`), English UI forced. Google
+(`readState`, `prejoin`, `clickJoin`, `readNames`, `captionsOn`,
+`readCaptions`), English UI forced. Google
 changes them without notice; the block carries the date it was last checked
 live.
 

@@ -641,7 +641,8 @@ func meetJob() Job {
 }
 
 // A Meet job runs meet.js next to RECORDER_PATH with the record.js flags minus
-// --tracks-dir (the fake exits 2 on it), the Meet join timeout, and a WAV.
+// --tracks-dir (the fake exits 2 on it), the Meet join timeout, and a WAV,
+// plus --captions-out, whose file the fake reports back as "captions".
 func TestRunMeetSuccess(t *testing.T) {
 	r, z, finished := newTestRunner(t, "rec_ok.sh")
 	r.cfg.MeetJoinTimeoutS = 1200
@@ -656,8 +657,9 @@ func TestRunMeetSuccess(t *testing.T) {
 		t.Fatal("onFinished was never called")
 	}
 	wantAudio := filepath.Join(jobDir(r.cfg.DataDir, job.ID), "audio.wav")
+	wantCaptions := filepath.Join(jobDir(r.cfg.DataDir, job.ID), "captions.jsonl")
 	if got.State != JobFinished || got.Source != SourceMeet || got.AudioPath != wantAudio ||
-		got.DurationS != 90 || got.Tracks != nil || got.DMUserID != 7 {
+		got.DurationS != 90 || got.Tracks != nil || got.DMUserID != 7 || got.CaptionsPath != wantCaptions {
 		t.Errorf("job = %+v", got)
 	}
 	args, err := os.ReadFile(wantAudio + ".args")
@@ -665,7 +667,8 @@ func TestRunMeetSuccess(t *testing.T) {
 		t.Fatalf("fake meet.js args: %v", err)
 	}
 	want := "--url https://meet.google.com/abc-defg-hij --out " + wantAudio +
-		" --join-timeout 1200 --max-duration 14400 --empty-grace 60 --display-name NoteTaker\n"
+		" --join-timeout 1200 --max-duration 14400 --empty-grace 60 --display-name NoteTaker" +
+		" --captions-out " + wantCaptions + "\n"
 	if string(args) != want {
 		t.Errorf("meet.js args = %q, want %q", args, want)
 	}

@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 // Requiring must not launch a browser or run the CLI.
 const meet = require('./meet.js');
-const { parseArgs, meetingCode, meetShouldStop, otherNames, readState, finalizeWav, silentWav, RATE } = meet;
+const { parseArgs, meetingCode, meetShouldStop, otherNames, readState, finalizeWav, silentWav, RATE, foldCaptions, captionHint, CAPTION_SETTLE_MS } = meet;
 
 const URL = 'https://meet.google.com/abc-defg-hij';
 const MIN = ['--url', URL, '--out', '/tmp/a.wav'];
@@ -28,6 +28,61 @@ test('parseArgs takes the record.js flags and defaults', () => {
   assert.strictEqual(o.maxDuration, 90);
   assert.strictEqual(o.emptyGrace, 5);
   assert.strictEqual(o.displayName, 'Bot');
+});
+
+test('parseArgs takes --captions-out anywhere among the pairs', () => {
+  assert.strictEqual(parseArgs([...MIN, '--captions-out', '/tmp/c.jsonl']).captionsOut, '/tmp/c.jsonl');
+  const o = parseArgs(['--captions-out', '/tmp/c.jsonl', ...MIN, '--join-timeout', '30']);
+  assert.strictEqual(o.captionsOut, '/tmp/c.jsonl');
+  assert.strictEqual(o.joinTimeout, 30);
+  assert.throws(() => parseArgs([...MIN, '--captions-out']), /missing value/);
+});
+
+test('foldCaptions stores each utterance once, with its final text', () => {
+  const st = { open: new Map(), done: new Set() };
+  const t = 1_000_000;
+  const out = [];
+  // Meet grows block 1 while Alice talks, then Bob starts block 2.
+  out.push(...foldCaptions(st, [{ id: '1', name: 'Alice', text: 'Hello' }], t));
+  out.push(...foldCaptions(st, [{ id: '1', name: 'Alice', text: 'Hello every' }], t + 1000));
+  out.push(...foldCaptions(st, [{ id: '1', name: 'Alice', text: 'Hello everyone.' }, { id: '2', name: 'Bob', text: 'Hi' }], t + 2000));
+  assert.deepStrictEqual(out, [], 'nothing is final while it may still change');
+  // Block 1 settles while Bob's newest block keeps changing.
+  out.push(...foldCaptions(st, [{ id: '1', name: 'Alice', text: 'Hello everyone.' }, { id: '2', name: 'Bob', text: 'Hi there' }], t + 2000 + CAPTION_SETTLE_MS));
+  assert.deepStrictEqual(out, [{ at: t, speaker: 'Alice', text: 'Hello everyone.' }]);
+  // Seeing a finished block again does not repeat it; a block leaving the DOM finalizes it.
+  out.push(...foldCaptions(st, [{ id: '1', name: 'Alice', text: 'Hello everyone.' }], t + 9000));
+  assert.deepStrictEqual(out[1], { at: t + 2000, speaker: 'Bob', text: 'Hi there' });
+  assert.strictEqual(out.length, 2);
+});
+
+test('foldCaptions splits a block Meet restarts, and flush drains the rest', () => {
+  const st = { open: new Map(), done: new Set() };
+  const long = 'a long monologue that goes on and on';
+  assert.deepStrictEqual(foldCaptions(st, [{ id: '7', name: 'Ann', text: long }], 0), []);
+  const cut = foldCaptions(st, [{ id: '7', name: 'Ann', text: 'and more' }], 1000);
+  assert.deepStrictEqual(cut, [{ at: 0, speaker: 'Ann', text: long }]);
+  const rest = foldCaptions(st, [{ id: '7', name: 'Ann', text: 'and more' }], 1500, true);
+  assert.deepStrictEqual(rest, [{ at: 1000, speaker: 'Ann', text: 'and more' }]);
+  assert.deepStrictEqual(foldCaptions(st, [], 2000, true), []);
+});
+
+test('foldCaptions: a block cleared on screen ends its turn and may start another', () => {
+  const st = { open: new Map(), done: new Set() };
+  foldCaptions(st, [{ id: '3', name: 'Ann', text: 'first turn' }], 0);
+  const end = foldCaptions(st, [{ id: '3', name: 'Ann', text: '' }], 1000);
+  assert.deepStrictEqual(end.map((u) => u.text), ['first turn']);
+  foldCaptions(st, [{ id: '3', name: 'Ann', text: 'second turn' }], 2000);
+  const rest = foldCaptions(st, [], 3000, true);
+  assert.deepStrictEqual(rest.map((u) => u.text), ['second turn']);
+  assert.strictEqual(foldCaptions(st, [{ id: '9', name: '', text: 'x' }], 4000, true)[0].speaker, '?');
+});
+
+test('captionHint: seconds since the recording started, monotonic, never negative', () => {
+  const u = (at) => ({ at, speaker: 'Ann', text: 'hi' });
+  assert.deepStrictEqual(captionHint(u(13_460), 10_000, 0), { offset_s: 3.5, speaker: 'Ann', text: 'hi' });
+  assert.strictEqual(captionHint(u(9_000), 10_000, 0).offset_s, 0, 'before the start clamps to 0');
+  assert.strictEqual(captionHint(u(12_000), 10_000, 3.5).offset_s, 3.5, 'out of order clamps to the previous line');
 });
 
 test('parseArgs rejects bad input, including a non-Meet URL', () => {
@@ -175,7 +230,26 @@ function prejoin() {
 }
 async function admit() {
   ui.innerHTML = '<button aria-label="Leave call">x</button>' +
-    '<div data-participant-id="a">Alice<br>more</div><div data-participant-id="b">NoteTaker</div>';
+    '<div data-participant-id="a">Alice<br>more</div><div data-participant-id="b">NoteTaker</div>' +
+    '<button id="cc" aria-label="Turn on captions">cc</button>';
+  // Captions: Meet-like blocks (speaker + text), rewritten in place while the speaker talks.
+  document.getElementById('cc').onclick = (e) => {
+    e.target.setAttribute('aria-label', 'Turn off captions');
+    const region = document.createElement('div');
+    region.setAttribute('role', 'region');
+    region.setAttribute('aria-label', 'Captions');
+    ui.appendChild(region);
+    const say = (name, text) => {
+      const b = document.createElement('div');
+      b.className = 'nMcdL';
+      b.innerHTML = '<div class="NWpY1d">' + name + '</div><div class="ygicle">' + text + '</div>';
+      region.appendChild(b);
+      return b.querySelector('.ygicle');
+    };
+    const alice = say('Alice', 'Hello');
+    setTimeout(() => (alice.textContent = 'Hello everyone'), 500);
+    setTimeout(() => say('Bob', 'Hi Alice'), 1500);
+  };
   const leave = Number(params.get('aliceLeavesAfter') || 0);
   if (leave) setTimeout(() => document.querySelector('[data-participant-id="a"]').remove(), leave * 1000);
   const src = new AudioContext();
@@ -266,7 +340,8 @@ test('end to end: knocks muted, records the call audio, SIGTERM finalizes the WA
   const restore = fakeMeet();
   try {
     const out = path.join(dir, 'job', 'audio.wav');
-    const { code, stdout } = await runMain(['--url', URL, '--out', out, '--join-timeout', '60'], async () => {
+    const captions = path.join(dir, 'job', 'captions.jsonl');
+    const { code, stdout } = await runMain(['--url', URL, '--out', out, '--join-timeout', '60', '--captions-out', captions], async () => {
       for (let i = 0; i < 300 && !fs.existsSync(out); i++) await new Promise((r) => setTimeout(r, 100));
       await new Promise((r) => setTimeout(r, 6000)); // record ~6 s
       process.emit('SIGTERM', 'SIGTERM');
@@ -278,6 +353,10 @@ test('end to end: knocks muted, records the call audio, SIGTERM finalizes the WA
     assert.deepStrictEqual(res.participants, ['Alice']);
     assert.ok(res.duration_s > 3, `duration ${res.duration_s}`);
     assert.strictEqual(res.tracks, undefined);
+    assert.strictEqual(res.captions, captions);
+    const hints = fs.readFileSync(captions, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepStrictEqual(hints.map((h) => [h.speaker, h.text]), [['Alice', 'Hello everyone'], ['Bob', 'Hi Alice']]);
+    assert.ok(hints[0].offset_s >= 0 && hints[1].offset_s >= hints[0].offset_s, `offsets ${hints.map((h) => h.offset_s)}`);
     const b = fs.readFileSync(out);
     assert.strictEqual(b.readUInt32LE(4), b.length - 8, 'header finalized');
     assert.strictEqual(b.readUInt32LE(24), RATE);
@@ -301,6 +380,7 @@ test('end to end: stops on its own once the room is empty', { skip, timeout: 120
     assert.strictEqual(code, 0);
     const res = JSON.parse(stdout);
     assert.strictEqual(res.reason, 'empty_room');
+    assert.strictEqual(res.captions, undefined, 'no --captions-out, no captions key');
     assert.deepStrictEqual(res.participants, ['Alice']);
   } finally {
     restore();

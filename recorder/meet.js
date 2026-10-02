@@ -18,6 +18,13 @@
 // are digital silence and a black frame, Meet's mic/camera toggles are turned
 // off before joining and re-checked in the call, and lockMedia() disables every
 // captured track so Meet cannot re-enable it.
+//
+// Speaker hints (--captions-out): Meet gives no per-participant audio, but its
+// live captions name the speaker of every utterance. With the flag, captions
+// are turned on after admission (visible to participants — owner-approved) and
+// each finished utterance becomes one JSONL line {offset_s, speaker, text};
+// the transcriber aligns them to its own transcript. Captions failing never
+// affects the recording.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -31,6 +38,7 @@ const USAGE = `usage: meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out
                [--empty-grace <sec, default 60>]
                [--display-name <str, default NoteTaker>]
                [--tracks-dir <dir>]  (accepted and ignored: Meet has no per-participant audio)
+               [--captions-out <captions.jsonl>]  (Meet captions as speaker hints)
 `;
 
 const POLL_MS = 2000;
@@ -49,11 +57,16 @@ const scrub = (msg) => String(msg).replace(/https?:\/\/\S+/g, '<url>');
 // decision, the Go side passes its MEET_JOIN_TIMEOUT_S (same default).
 const JOIN_TIMEOUT_S = 1200;
 
-/** record.js's flags and checks, plus: the URL must be a Meet meeting, and the
- * --join-timeout default is JOIN_TIMEOUT_S. */
+/** record.js's flags and checks, plus: the URL must be a Meet meeting, the
+ * --join-timeout default is JOIN_TIMEOUT_S, and --captions-out <path>. */
 function parseArgs(argv) {
-  const opts = parseRecordArgs(argv);
   // record.js parses strict flag/value pairs, so flags sit at even indices.
+  const at = argv.findIndex((a, i) => i % 2 === 0 && a === '--captions-out');
+  const captionsOut = at < 0 ? undefined : argv[at + 1];
+  if (at >= 0 && !captionsOut) throw new Error('missing value for --captions-out');
+  if (at >= 0) argv = [...argv.slice(0, at), ...argv.slice(at + 2)];
+  const opts = parseRecordArgs(argv);
+  if (captionsOut) opts.captionsOut = captionsOut;
   if (!argv.some((a, i) => i % 2 === 0 && a === '--join-timeout')) opts.joinTimeout = JOIN_TIMEOUT_S;
   if (!/^https:\/\/meet\.google\.com\/./.test(opts.url)) throw new Error('--url must be a https://meet.google.com/... URL');
   return opts;
@@ -74,6 +87,64 @@ function meetingCode(url) {
 function meetShouldStop({ others, aloneSince, now, emptyGrace, startedAt, maxDuration }) {
   const membersCount = others === null ? 2 : others.length + 1;
   return shouldStop({ membersCount, aloneSince, now, emptyGrace, startedAt, maxDuration });
+}
+
+const CAPTION_SETTLE_MS = 3000;
+
+/**
+ * Fold one captions poll (readCaptions' blocks) into finished utterances. Meet
+ * rewrites the newest block while its speaker talks (and corrects older ones
+ * for a moment), so a block is final once it left the DOM, or a newer block
+ * exists and it has not changed for CAPTION_SETTLE_MS, or the run ends
+ * (`flush`). A block whose text shrinks to under half is Meet restarting a long
+ * turn in the same element: the old text is final. Returns [{at, speaker,
+ * text}] (`at` = ms when the utterance first showed), each one once.
+ * `st` = { open: Map(id -> utterance), done: Set(id) }.
+ * ponytail: corrections Meet makes after a block is final are dropped.
+ */
+function foldCaptions(st, blocks, now, flush = false) {
+  const out = [];
+  const emit = (u) => out.push({ at: u.first, speaker: u.speaker, text: u.text });
+  const final = (id) => {
+    emit(st.open.get(id));
+    st.open.delete(id);
+    st.done.add(id);
+  };
+  const present = new Set();
+  for (const b of blocks) {
+    if (!b.text) {
+      // Still on screen but cleared: its turn is over and Meet may reuse the
+      // element for the next one, so its id may start a new utterance.
+      present.add(b.id);
+      if (st.open.has(b.id)) final(b.id);
+      st.done.delete(b.id);
+      continue;
+    }
+    if (st.done.has(b.id)) continue;
+    present.add(b.id);
+    const u = st.open.get(b.id);
+    if (!u) st.open.set(b.id, { speaker: b.name || '?', text: b.text, first: now, changed: now });
+    else if (b.text !== u.text) {
+      if (b.text.length < u.text.length / 2) {
+        emit(u);
+        u.first = now;
+      }
+      Object.assign(u, { speaker: b.name || u.speaker, text: b.text, changed: now });
+    }
+  }
+  const withText = blocks.filter((b) => b.text);
+  const newest = withText.length ? withText[withText.length - 1].id : null;
+  for (const [id, u] of [...st.open]) {
+    if (flush || !present.has(id) || (id !== newest && now - u.changed >= CAPTION_SETTLE_MS)) final(id);
+  }
+  return out;
+}
+
+/** One speaker-hint line: seconds since the recording started, 0.1 s steps,
+ * never before `prev` (blocks can finalize out of order) nor before 0. */
+function captionHint(u, startedAt, prev) {
+  const offset = Math.max(prev, 0, Math.round((u.at - startedAt) / 100) / 10);
+  return { offset_s: offset, speaker: u.speaker, text: u.text };
 }
 
 // --- page side ----------------------------------------------------------------
@@ -193,7 +264,83 @@ function readNames() {
   };
 }
 
+/** Captions on by the toolbar button; returns what it saw/did. The 'c'
+ * shortcut is the node-side fallback. Selectors as used by open-source Meet
+ * bots and caption extensions (aria-label, then the Material icon name). */
+function captionsOn(mayClick) {
+  const on = document.querySelector('button[aria-label*="Turn off captions" i], button[aria-label*="aption" i][aria-pressed="true"]');
+  if (on) return { on: true, did: null };
+  const b =
+    document.querySelector('button[aria-label*="Turn on captions" i]') ||
+    [...document.querySelectorAll('button')].find((x) => /closed_caption_off/.test(x.innerText || ''));
+  if (!b || !mayClick) return { on: false, did: null };
+  b.click();
+  return { on: false, did: `clicked "${(b.getAttribute('aria-label') || b.innerText || '').trim()}"` };
+}
+
+/** The caption blocks (one per speaker turn) in the captions region:
+ * [{id, name, text}]. Meet's classes are obfuscated and rotate, so: known
+ * classes first, then a structural guess (an element whose first child is a
+ * short one-line name and whose other children hold the text). Every block
+ * gets a stable id so foldCaptions can tell a rewrite from a new block. */
+function readCaptions() {
+  const region =
+    document.querySelector('[role="region"][aria-label*="aption" i]') ||
+    document.querySelector('div[role="region"][tabindex="0"]');
+  if (!region) return { region: false, blocks: [] };
+  const txt = (el) => ((el && el.innerText) || '').replace(/\s+/g, ' ').trim();
+  window.__capId = window.__capId || 0;
+  const id = (el) => el.dataset.capId || (el.dataset.capId = String(++window.__capId));
+  let blocks = [...region.querySelectorAll('.nMcdL')].map((b) => ({
+    id: id(b),
+    name: txt(b.querySelector('.NWpY1d, .KcIKyf, .zs7s8d')),
+    text: txt(b.querySelector('.ygicle, .bh44bd, .iTTPOb')),
+  }));
+  // Known blocks with a name count even while cleared (empty text): foldCaptions needs them.
+  if (!blocks.some((b) => b.name)) {
+    const cand = [...region.querySelectorAll('*')].filter((e) => {
+      if (e.children.length < 2) return false;
+      const name = (e.children[0].innerText || '').trim();
+      return name && name.length <= 80 && !name.includes('\n') && txt(e).length > name.length;
+    });
+    // A wrapper with two or more candidate children is the caption list, not a
+    // turn; of the rest the outermost wins (a text div of several spans can
+    // pass the test inside its turn).
+    const turns = cand.filter((e) => [...e.children].filter((c) => cand.includes(c)).length < 2);
+    blocks = turns
+      .filter((e) => !turns.some((o) => o !== e && o.contains(e)))
+      .map((e) => ({ id: id(e), name: txt(e.children[0]), text: [...e.children].slice(1).map(txt).filter(Boolean).join(' ') }));
+  }
+  return { region: true, blocks };
+}
+
 // --- node side ----------------------------------------------------------------
+
+/** Captions on: the toolbar button (two clicks at most: a button whose label
+ * never flips must not be toggled forever), then the 'c' shortcut. Never
+ * clicks once captions read as on, so it cannot toggle them back off. The
+ * caption language is left as the meeting has it: only speaker and time matter. */
+async function enableCaptions(page, stopped) {
+  let pressed = false;
+  let clicks = 0;
+  for (let i = 0; i < 10 && !stopped(); i++) {
+    const r = await page.evaluate(captionsOn, clicks < 2).catch(() => ({ on: false, did: null }));
+    if (r.on) {
+      log(`captions on${pressed ? ' (c shortcut)' : ''}`);
+      return;
+    }
+    if (r.did) {
+      clicks++;
+      log(`captions: ${r.did}`);
+    }
+    if (!clicks && !pressed && i >= 3) {
+      await page.keyboard.press('c').catch(() => {}); // Meet shortcut: toggle captions
+      pressed = true;
+    }
+    await sleep(1500);
+  }
+  log('captions: not confirmed on; still reading the captions region (the recording is not affected)');
+}
 
 /** Names other than the bot's, or null when the roster is unreadable — no
  * tile on screen, or any tile without name text: a missing name must never
@@ -371,6 +518,11 @@ async function main(argv) {
   opts.out = path.resolve(opts.out);
   fs.mkdirSync(path.dirname(opts.out), { recursive: true });
   fs.rmSync(opts.out, { force: true }); // truncate semantics, like record.js
+  if (opts.captionsOut) {
+    opts.captionsOut = path.resolve(opts.captionsOut);
+    fs.mkdirSync(path.dirname(opts.captionsOut), { recursive: true });
+    fs.rmSync(opts.captionsOut, { force: true });
+  }
 
   let reason = null;
   const onSignal = (sig) => {
@@ -471,13 +623,36 @@ async function main(argv) {
     let aloneSince = null;
     let failure = null;
     const participants = new Set(); // first-seen order
+    // Captions as speaker hints: one JSONL line per finished utterance.
+    const cap = { st: { open: new Map(), done: new Set() }, lines: 0, prev: 0 };
+    const pollCaptions = async (flush) => {
+      if (!opts.captionsOut) return;
+      const r = await page.evaluate(readCaptions).catch(() => null);
+      // A failed read is not "every block left": keep the open ones for the next poll.
+      if (!r && !flush) return;
+      for (const u of foldCaptions(cap.st, r ? r.blocks : [], Date.now(), flush)) {
+        const h = captionHint(u, startedAt, cap.prev);
+        cap.prev = h.offset_s;
+        try {
+          fs.appendFileSync(opts.captionsOut, JSON.stringify(h) + '\n');
+          cap.lines++;
+        } catch (e) {
+          log(`captions: write failed: ${e.message}`); // hints are optional; the recording goes on
+        }
+      }
+    };
+    if (opts.captionsOut) await enableCaptions(page, () => reason);
     for (let tick = 0; !reason && !failure; tick++) {
       // Every 10 s (and right away): Meet's mic/camera toggles stay off.
       if (tick % 5 === 0) {
         const p = await page.evaluate(prejoin, '').catch(() => null);
         if (p && (p.mic === 'on' || p.cam === 'on')) log(`in-call mic=${p.mic} cam=${p.cam}: turned off`);
       }
-      await sleep(POLL_MS);
+      // Captions every second: Meet drops old blocks from the DOM.
+      for (let i = 0; i < 2; i++) {
+        await sleep(POLL_MS / 2);
+        await pollCaptions(false);
+      }
       if (!alive(parec)) failure = `audio capture (parec) exited mid-call: ${parec.err.trim().split('\n').pop() || 'no error'}`;
       else if (!alive(pulse.proc)) failure = 'pulseaudio exited mid-call';
       else if (!browser.connected || pageGone) failure = 'the Meet page closed or crashed mid-call';
@@ -503,6 +678,8 @@ async function main(argv) {
     }
 
     log(`stopping: ${failure ? 'failed' : reason}`);
+    await pollCaptions(true);
+    if (opts.captionsOut) log(`captions: ${cap.lines} utterance(s)`);
     await stopProc(parec);
     const pcm = finalizeWav(opts.out);
     if (failure) {
@@ -516,7 +693,8 @@ async function main(argv) {
     const durationS = pcm / (RATE * 2);
     const size = fs.statSync(opts.out).size;
     log(`wrote ${size} bytes in ${durationS.toFixed(1)}s, ${participants.size} participant(s)`);
-    process.stdout.write(resultLine({ out: opts.out, durationS, reason, participants: [...participants] }));
+    const captions = cap.lines ? opts.captionsOut : undefined;
+    process.stdout.write(resultLine({ out: opts.out, durationS, reason, participants: [...participants], captions }));
     return 0;
   } finally {
     if (browser) await browser.close().catch(() => {});
@@ -545,6 +723,11 @@ module.exports = {
   otherNames,
   readState,
   readNames,
+  readCaptions,
+  captionsOn,
+  foldCaptions,
+  captionHint,
+  CAPTION_SETTLE_MS,
   prejoin,
   lockMedia,
   launchOpts,

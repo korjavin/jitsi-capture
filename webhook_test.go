@@ -258,14 +258,18 @@ func TestBuildPayloadSource(t *testing.T) {
 	if _, ok := raw["source"]; ok {
 		t.Errorf("jitsi payload has a source key: %s", jitsi)
 	}
+	if _, ok := raw["speaker_hints_path"]; ok {
+		t.Errorf("jitsi payload has a speaker_hints_path key: %s", jitsi)
+	}
 
 	job := finishedJob()
 	job.Stream, job.Topic, job.DMUserID = "", "", 7
 	job.JitsiURL, job.Source = "https://meet.google.com/abc-defg-hij", SourceMeet
 	job.AudioPath, job.Tracks = "/data/jobs/42/audio.wav", nil
+	job.CaptionsPath = "/data/jobs/42/captions.jsonl"
 	p := buildPayload(cfg, job)
 	if p.Source != "meet" || p.JitsiURL != job.JitsiURL || p.AudioPath != "/srv/capture/jobs/42/audio.wav" ||
-		p.DMUserID != 7 || p.Tracks != nil {
+		p.DMUserID != 7 || p.Tracks != nil || p.SpeakerHints != "/srv/capture/jobs/42/captions.jsonl" {
 		t.Errorf("meet payload = %+v", p)
 	}
 }
