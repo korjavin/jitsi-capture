@@ -259,7 +259,7 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   short — it falls back to `--max-duration` instead. The Meet page closing or
   crashing mid-call, or `parec`/PulseAudio exiting, is exit 5 (truncated).
 
-How the audio is captured — the only method the Meet spike found working:
+How the audio is captured — the only method live Meet tests found working:
 Meet plays call audio only to a participant that has media devices. Chromium
 gets a fake mic (a silent WAV) and a fake camera (one black frame), with the
 prompts auto-accepted; the bot switches both off before joining and re-checks
