@@ -188,6 +188,68 @@ func TestBotStartsADMJob(t *testing.T) {
 	}
 }
 
+// sentMessages returns the content of every message the bot posted.
+func (f *botFixture) sentMessages() []string {
+	var out []string
+	for _, r := range f.srv.requests() {
+		if r.method == http.MethodPost && r.path == "/api/v1/messages" {
+			out = append(out, r.form.Get("to")+" "+r.form.Get("content"))
+		}
+	}
+	return out
+}
+
+// A Meet link by DM starts a Meet job (query stripped) and tells the sender to
+// admit the bot; the same link in a stream is ignored, and a duplicate request
+// gets no second reply.
+func TestBotMeetDM(t *testing.T) {
+	const link = "https://meet.google.com/abc-defg-hij"
+	tests := []struct {
+		name     string
+		msg      Message
+		startErr error
+		wantJobs []Job
+		wantSent []string
+	}{
+		{
+			name:     "a DM starts a Meet job and asks to be admitted",
+			msg:      Message{ID: 300, Type: "private", Content: "record " + link + "?authuser=1&pli=1", SenderID: 42},
+			wantJobs: []Job{{ID: "300", MessageID: 300, DMUserID: 42, JitsiURL: link, Source: SourceMeet}},
+			wantSent: []string{"[42] Asking to join abc-defg-hij as a guest — admit NoteTaker from the lobby."},
+		},
+		{
+			name:     "a duplicate request is silent",
+			msg:      Message{ID: 300, Type: "private", Content: link, SenderID: 42},
+			startErr: ErrDuplicateJob,
+			wantJobs: []Job{{ID: "300", MessageID: 300, DMUserID: 42, JitsiURL: link, Source: SourceMeet}},
+		},
+		{
+			name: "a stream message gets no reaction and no job",
+			msg:  Message{ID: 301, Type: "stream", Content: link, DisplayRecipient: testStream, Subject: testTopic, SenderID: 42},
+		},
+		{
+			name: "a malformed meeting code is ignored",
+			msg:  Message{ID: 302, Type: "private", Content: "https://meet.google.com/abcdefghij", SenderID: 42},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBotFixture(t, "https://meet.jit.si", streamMessage(), tc.startErr)
+			f.bot.name = "NoteTaker"
+			f.bot.handle(context.Background(), Event{Type: "message", Message: &tc.msg})
+			if got := f.startedJobs(); !reflect.DeepEqual(got, tc.wantJobs) {
+				t.Errorf("jobs = %+v; want %+v", got, tc.wantJobs)
+			}
+			if got := f.sentMessages(); !reflect.DeepEqual(got, tc.wantSent) {
+				t.Errorf("sent = %q; want %q", got, tc.wantSent)
+			}
+			if got := f.reactions(); got != nil {
+				t.Errorf("reactions = %v; want none", got)
+			}
+		})
+	}
+}
+
 // The recording indicator is the runner's, so a start that never took hold
 // leaves no reaction behind for the bot to take off, and a duplicate click
 // leaves the running job's indicator alone.

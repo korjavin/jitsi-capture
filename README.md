@@ -63,6 +63,20 @@ accidental recordings of short calls.
 request, so the recording starts right away — no 🎙️ step, 🔴 goes on the DM.
 Failure notes and the "transcript ready" message come back in the same DM.
 
+**Google Meet, by direct message.** DM the bot a
+`https://meet.google.com/xxx-yyyy-zzz` link — before or during the call. The bot
+runs [`recorder/meet.js`](recorder/README.md) (next to `RECORDER_PATH`) as an
+anonymous guest and replies once: *"Asking to join xxx-yyyy-zzz as a guest —
+admit NoteTaker from the lobby."* Somebody in the call **has to admit it**; until
+then it keeps knocking, up to `MEET_JOIN_TIMEOUT_S` (default 20 min), so a link
+sent ahead of the call still works. A call that already ended cannot be
+recorded (nobody admits → the usual "not admitted" note). DM only: a Meet link
+in a stream gets no reaction. Only the meeting code is kept — any query string
+is dropped. The audio is **16 kHz mono WAV** (`audio.wav`, no per-speaker
+tracks); the transcriber must decode WAV as well as WebM/Opus — confirm that
+before deploying. Everything else (🔴, failure notes, webhook, retention) is the
+Jitsi flow.
+
 **Google Meet spike (diagnostic).** DM the bot
 `meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N] [lang=<code>]`
 (default 90, max 600) to run [`recorder/spike/meet-spike.js`](recorder/spike/README.md) from
@@ -163,6 +177,8 @@ onto `HOST_DATA_DIR` — so the receiving service reads the file through its own
 bind mount. `tracks` is omitted when the recorder produced no per-speaker files.
 A job started by DM has empty `stream` and `topic` and carries
 `"dm_user_id": <sender's Zulip user id>` instead (omitted for stream jobs).
+A Google Meet job adds `"source": "meet"` (omitted for Jitsi), keeps the meeting
+URL in `jitsi_url`, has no `tracks`, and its `audio_path` ends in `audio.wav`.
 
 Verifying the signature:
 
@@ -201,7 +217,7 @@ refused the message.
 
 ```text
 DATA_DIR/jobs/<id>/job.json      # id = the Zulip message id
-DATA_DIR/jobs/<id>/audio.webm    # mixed conference audio
+DATA_DIR/jobs/<id>/audio.webm    # mixed conference audio (audio.wav for a Meet job)
 DATA_DIR/jobs/<id>/tracks/       # per-participant files, when available
 ```
 
@@ -234,6 +250,7 @@ dotenv loading — Compose passes `.env` through `env_file`.
 | `RECORDER_PATH` | `recorder/record.js` | Node recorder (the image sets `/app/recorder/record.js`) |
 | `BOT_DISPLAY_NAME` | `NoteTaker` | Display name in the call |
 | `JOIN_TIMEOUT_S` | `600` | Give up if not admitted within this many seconds |
+| `MEET_JOIN_TIMEOUT_S` | `1200` | The same for a Google Meet job (the bot keeps re-knocking until then) |
 | `MAX_DURATION_S` | `14400` | Hard cap on one recording |
 | `EMPTY_GRACE_S` | `60` | Stop after this long alone in the room |
 | `MIN_RECORDING_S` | `15` | Shorter recordings are reported as `too_short` |

@@ -48,6 +48,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		got, want int
 	}{
 		{"JoinTimeoutS", c.JoinTimeoutS, 600},
+		{"MeetJoinTimeoutS", c.MeetJoinTimeoutS, 1200},
 		{"MaxDurationS", c.MaxDurationS, 14400},
 		{"EmptyGraceS", c.EmptyGraceS, 60},
 		{"MinRecordingS", c.MinRecordingS, 15},
@@ -124,6 +125,7 @@ func TestLoadConfigTrimsAndOverrides(t *testing.T) {
 	t.Setenv("PUBLIC_URL", "https://capture.example.com/")
 	t.Setenv("DATA_DIR", "/srv/data")
 	t.Setenv("MIN_RECORDING_S", "30")
+	t.Setenv("MEET_JOIN_TIMEOUT_S", "7200")
 
 	c, err := loadConfig()
 	if err != nil {
@@ -140,5 +142,8 @@ func TestLoadConfigTrimsAndOverrides(t *testing.T) {
 	}
 	if c.MinRecordingS != 30 {
 		t.Errorf("MinRecordingS = %d, want 30", c.MinRecordingS)
+	}
+	if c.MeetJoinTimeoutS != 7200 {
+		t.Errorf("MeetJoinTimeoutS = %d, want 7200", c.MeetJoinTimeoutS)
 	}
 }

@@ -23,6 +23,7 @@ type Config struct {
 	BotDisplayName string
 
 	JoinTimeoutS       int
+	MeetJoinTimeoutS   int // a Meet link may be sent before the call; the bot keeps knocking this long
 	MaxDurationS       int
 	EmptyGraceS        int
 	MinRecordingS      int
@@ -82,6 +83,7 @@ func loadConfig() (Config, error) {
 		BotDisplayName: str("BOT_DISPLAY_NAME", "NoteTaker"),
 
 		JoinTimeoutS:       num("JOIN_TIMEOUT_S", 600),
+		MeetJoinTimeoutS:   num("MEET_JOIN_TIMEOUT_S", 1200),
 		MaxDurationS:       num("MAX_DURATION_S", 14400),
 		EmptyGraceS:        num("EMPTY_GRACE_S", 60),
 		MinRecordingS:      num("MIN_RECORDING_S", 15),

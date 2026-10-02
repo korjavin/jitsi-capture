@@ -70,7 +70,8 @@ type finishedPayload struct {
 	Stream       string   `json:"stream"`
 	Topic        string   `json:"topic"`
 	DMUserID     int64    `json:"dm_user_id,omitempty"` // DM-started job: stream and topic are empty
-	JitsiURL     string   `json:"jitsi_url"`
+	JitsiURL     string   `json:"jitsi_url"`            // a Meet job's meeting URL too
+	Source       string   `json:"source,omitempty"`     // "meet" for a Google Meet job
 	AudioPath    string   `json:"audio_path"`
 	DurationS    float64  `json:"duration_s"`
 	StartedAt    string   `json:"started_at"`
@@ -104,6 +105,7 @@ func buildPayload(cfg Config, job Job) finishedPayload {
 		Topic:        job.Topic,
 		DMUserID:     job.DMUserID,
 		JitsiURL:     job.JitsiURL,
+		Source:       job.Source,
 		AudioPath:    hostPath(cfg, job.AudioPath),
 		DurationS:    job.DurationS,
 		StartedAt:    job.StartedAt.Format(time.RFC3339),

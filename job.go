@@ -18,13 +18,14 @@ type Job struct {
 	Stream        string     `json:"stream"`
 	Topic         string     `json:"topic"`
 	DMUserID      int64      `json:"dm_user_id,omitempty"` // set for a DM-started job; replies go back to this user
-	JitsiURL      string     `json:"jitsi_url"`            // room URL only — never tokens/passwords
+	JitsiURL      string     `json:"jitsi_url"`            // room URL only — never tokens/passwords; a Meet job's meeting URL too
+	Source        string     `json:"source,omitempty"`     // "" (Jitsi) or SourceMeet
 	State         string     `json:"state"`                // recording | finished | failed
 	Error         string     `json:"error,omitempty"`
 	StartedAt     time.Time  `json:"started_at"`
 	EndedAt       *time.Time `json:"ended_at,omitempty"`
 	DurationS     float64    `json:"duration_s"`
-	AudioPath     string     `json:"audio_path,omitempty"` // container path DATA_DIR/jobs/<id>/audio.webm
+	AudioPath     string     `json:"audio_path,omitempty"` // container path DATA_DIR/jobs/<id>/audio.webm (audio.wav for Meet)
 	Participants  []string   `json:"participants"`
 	WebhookSentAt *time.Time `json:"webhook_sent_at,omitempty"`
 	Tracks        []Track    `json:"tracks,omitempty"` // filled once the recorder emits per-participant audio
@@ -38,6 +39,9 @@ type Track struct {
 	OffsetS float64 `json:"offset_s"`
 	EndedS  float64 `json:"ended_s"`
 }
+
+// SourceMeet marks a Google Meet job; an empty Source is a Jitsi one.
+const SourceMeet = "meet"
 
 // Job.State values.
 const (
