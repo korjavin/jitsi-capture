@@ -554,6 +554,9 @@ async function startPulse(wavPath) {
     procs.push(p);
     return p;
   };
+  // A forced exit (second SIGINT, the 15 s fallback) skips stop(): unlike
+  // Chromium these children have no exit hook, and parec would grow the WAV forever.
+  process.on('exit', () => procs.forEach((p) => p.exitCode === null && !p.signalCode && p.kill('SIGINT')));
   const stop = async () => {
     for (const p of procs.reverse()) {
       if (p.exitCode !== null || p.signalCode) continue;
@@ -819,6 +822,13 @@ async function main() {
       cap.on = await enableCaptions(page);
       if (o.lang) summary.captionLang = (await pickCaptionLang(page, o.lang)) ? o.lang : 'not set';
     }
+    const track = (m) => {
+      peaks.mix = Math.max(peaks.mix, m.recRms || 0);
+      peaks.tab = Math.max(peaks.tab, m.tabRms || 0);
+      peaks.meetCtx = Math.max(peaks.meetCtx, m.tapRms || 0);
+      peaks.taps = Math.max(peaks.taps, m.taps || 0);
+      return m;
+    };
     const recEnd = Date.now() + o.seconds * 1000;
     let tick = 0;
     while (!stop && Date.now() < recEnd) {
@@ -834,11 +844,7 @@ async function main() {
           break;
         }
       }
-      const m = await media();
-      peaks.mix = Math.max(peaks.mix, m.recRms || 0);
-      peaks.tab = Math.max(peaks.tab, m.tabRms || 0);
-      peaks.meetCtx = Math.max(peaks.meetCtx, m.tapRms || 0);
-      peaks.taps = Math.max(peaks.taps, m.taps || 0);
+      const m = track(await media());
       log('media', {
         liveAudioTracks: m.liveAudio,
         pcs: m.pcs,
@@ -863,6 +869,7 @@ async function main() {
       await pollCaptions(true);
       summary.captions = capStats();
     }
+    track(await media()); // the levels since the last media line
     await page.evaluate(stopRecorder).catch(() => {});
     summary.recordedS = Math.round((Date.now() - admittedAt) / 1000);
     return 0;
