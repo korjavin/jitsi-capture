@@ -129,9 +129,69 @@ function foldCaptions(st, blocks, now, flush = false) {
 /** Injected before any Meet script: hooks RTCPeerConnection to see every
  * remote audio track and mixes them all into one MediaStreamDestination. */
 function installHooks() {
-  const S = (window.__spike = { events: [], pcs: [], els: [], ctx: null, dest: null, rec: null, recPeak: 0, pending: new Set() });
+  const S = (window.__spike = { events: [], pcs: [], els: [], pageEls: [], taps: new Map(), tapPeak: 0, ctx: null, dest: null, recs: [], peaks: { mix: 0, tab: 0 }, pending: new Set() });
   const Orig = window.RTCPeerConnection;
   if (!Orig) return;
+  const rms = (an, buf) => {
+    an.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    return Math.sqrt(sum / buf.length);
+  };
+  // Record `stream` with MediaRecorder, shipping 1 s chunks to the exposed node
+  // function `fn`; S.peaks[key] = the loudest 200 ms of exactly what it records
+  // since the last poll.
+  S.record = (stream, fn, key) => {
+    const rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+    rec.ondataavailable = (e) => {
+      if (!e.data || !e.data.size) return;
+      const p = e.data.arrayBuffer().then((b) => {
+        const u8 = new Uint8Array(b);
+        let bin = '';
+        for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+        return window[fn](btoa(bin)); // exposeFunction only carries strings
+      });
+      S.pending.add(p);
+      p.finally(() => S.pending.delete(p));
+    };
+    rec.start(1000);
+    S.recs.push(rec);
+    const an = S.ctx.createAnalyser();
+    S.ctx.createMediaStreamSource(stream).connect(an);
+    const buf = new Float32Array(an.fftSize);
+    setInterval(() => (S.peaks[key] = Math.max(S.peaks[key], rms(an, buf))), 200);
+  };
+  // Method "meetCtx": run 2 saw no <audio> elements, so Meet may play remote
+  // audio through its own WebAudio graph. Tap whatever any AudioContext other
+  // than ours sends to its speakers (level only, no file).
+  const connect = AudioNode.prototype.connect;
+  AudioNode.prototype.connect = function (target, ...rest) {
+    const r = connect.call(this, target, ...rest);
+    try {
+      if (target instanceof AudioDestinationNode && this.context !== S.ctx) {
+        let tap = S.taps.get(this.context);
+        if (!tap) {
+          tap = this.context.createAnalyser();
+          tap.buf = new Float32Array(tap.fftSize);
+          S.taps.set(this.context, tap);
+          S.events.push({ type: 'page-ctx', rate: this.context.sampleRate, state: this.context.state });
+        }
+        connect.call(this, tap);
+      }
+    } catch (e) {
+      S.events.push({ type: 'tap-error', msg: String(e) });
+    }
+    return r;
+  };
+  setInterval(() => {
+    for (const an of S.taps.values()) S.tapPeak = Math.max(S.tapPeak, rms(an, an.buf));
+  }, 200);
+  // Media elements the page plays a MediaStream with, attached to the DOM or not.
+  const play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    if (this.srcObject && !S.els.includes(this) && !S.pageEls.includes(this)) S.pageEls.push(this);
+    return play.apply(this, arguments);
+  };
   const mix = (track) => {
     // Chromium only decodes (pulls) a remote WebRTC audio track while a media
     // element plays it; a track fed to WebAudio alone can stay digital silence.
@@ -164,7 +224,8 @@ function installHooks() {
   function Hooked(...args) {
     const pc = new Orig(...args);
     const pcIndex = S.pcs.push(pc) - 1;
-    S.events.push({ type: 'pc-created', pcIndex });
+    // encoded: Meet asked for insertable streams (it may transform the audio frames itself).
+    S.events.push({ type: 'pc-created', pcIndex, encoded: !!(args[0] && args[0].encodedInsertableStreams) });
     pc.addEventListener('track', (ev) => {
       const t = ev.track;
       S.events.push({
@@ -357,41 +418,38 @@ function startRecorder() {
     S.dest = S.ctx.createMediaStreamDestination();
   }
   if (S.ctx.state === 'suspended') S.ctx.resume();
-  S.rec = new MediaRecorder(S.dest.stream, { mimeType: 'audio/webm;codecs=opus' });
-  S.rec.ondataavailable = (e) => {
-    if (!e.data || !e.data.size) return;
-    const p = e.data.arrayBuffer().then((b) => {
-      const u8 = new Uint8Array(b);
-      let bin = '';
-      for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
-      return window.__spikeChunk(btoa(bin)); // exposeFunction only carries strings
-    });
-    S.pending.add(p);
-    p.finally(() => S.pending.delete(p));
-  };
-  S.rec.start(1000);
-  // The level of exactly what MediaRecorder gets: peak RMS between two polls.
-  const an = S.ctx.createAnalyser();
-  S.ctx.createMediaStreamSource(S.dest.stream).connect(an);
-  const buf = new Float32Array(an.fftSize);
-  setInterval(() => {
-    an.getFloatTimeDomainData(buf);
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-    S.recPeak = Math.max(S.recPeak, Math.sqrt(sum / buf.length));
-  }, 200);
+  S.record(S.dest.stream, '__spikeChunk', 'mix');
   return S.ctx.state;
+}
+
+/** Method "tab": capture this tab's own audio output with getDisplayMedia
+ * (needs --auto-accept-this-tab-capture; Puppeteer's evaluate counts as a user
+ * gesture). Call after startRecorder. Returns what happened. */
+async function startTabCapture() {
+  const S = window.__spike;
+  try {
+    const s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, preferCurrentTab: true });
+    const audio = s.getAudioTracks();
+    if (!audio.length) return 'no audio track';
+    S.record(new MediaStream(audio), '__spikeTabChunk', 'tab');
+    return 'recording';
+  } catch (e) {
+    return 'error: ' + String(e);
+  }
 }
 
 function stopRecorder() {
   const S = window.__spike;
-  if (!S.rec || S.rec.state === 'inactive') return Promise.resolve();
-  const stopped = new Promise((r) => {
-    S.rec.onstop = r;
-    setTimeout(r, 4000);
-  });
-  S.rec.stop();
-  return stopped.then(() => Promise.race([Promise.allSettled([...S.pending]), new Promise((r) => setTimeout(r, 4000))]));
+  const live = S.recs.filter((r) => r.state !== 'inactive');
+  const stopped = live.map(
+    (r) =>
+      new Promise((done) => {
+        r.onstop = done;
+        setTimeout(done, 4000);
+        r.stop();
+      }),
+  );
+  return Promise.all(stopped).then(() => Promise.race([Promise.allSettled([...S.pending]), new Promise((r) => setTimeout(r, 4000))]));
 }
 
 /** Drain hook events and sample per-SSRC inbound audio (are the ~3 streams
@@ -414,6 +472,8 @@ async function pollMedia() {
             lvl: r.audioLevel === undefined ? null : Number(r.audioLevel.toFixed(3)),
             nrg: r.totalAudioEnergy === undefined ? null : Number(r.totalAudioEnergy.toFixed(4)),
             smp: r.totalSamplesReceived === undefined ? null : r.totalSamplesReceived,
+            conc: r.concealedSamples === undefined ? null : r.concealedSamples,
+            jbe: r.jitterBufferEmittedCount === undefined ? null : r.jitterBufferEmittedCount,
             kB: Math.round((r.bytesReceived || 0) / 1024),
           });
       });
@@ -425,16 +485,34 @@ async function pollMedia() {
   );
   // Meet's own <audio> elements vs ours: is anything actually playing?
   const els = (a) => ({ n: a.length, playing: a.filter((e) => !e.paused).length, muted: a.filter((e) => e.muted).length });
-  const recRms = Number(S.recPeak.toFixed(4));
-  S.recPeak = 0;
-  return { events, inbound, liveAudio, ctx: S.ctx && S.ctx.state, meetEls: els([...document.querySelectorAll('audio')]), ourEls: els(S.els), recRms };
+  const recRms = Number(S.peaks.mix.toFixed(4));
+  const tabRms = Number(S.peaks.tab.toFixed(4));
+  const tapRms = Number(S.tapPeak.toFixed(4));
+  // Audio output devices the page sees (0 = Meet's "Speaker not found").
+  const outs = await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').length, () => null);
+  S.peaks.mix = S.peaks.tab = S.tapPeak = 0;
+  return {
+    events,
+    inbound,
+    liveAudio,
+    pcs: S.pcs.length,
+    outs,
+    ctx: S.ctx && S.ctx.state,
+    meetEls: els([...document.querySelectorAll('audio')]),
+    pageEls: els(S.pageEls),
+    ourEls: els(S.els),
+    recRms,
+    tabRms,
+    taps: S.taps.size,
+    tapRms,
+  };
 }
 
 // --- node side ---------------------------------------------------------------
 
 function launchOpts(o) {
   // English UI on purpose: every phrase matched below is English.
-  const args = ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--window-size=1280,800', '--lang=en-US', '--no-first-run', '--no-default-browser-check'];
+  const args = ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--auto-accept-this-tab-capture', '--window-size=1280,800', '--lang=en-US', '--no-first-run', '--no-default-browser-check'];
   const opts = {
     headless: o.headful || o.login ? false : true, // true == new headless in puppeteer >= 22
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -442,15 +520,92 @@ function launchOpts(o) {
     defaultViewport: null,
     args,
     handleSIGINT: false,
+    // Puppeteer mutes headless audio by default: the null sink would hear nothing.
+    ignoreDefaultArgs: ['--mute-audio'],
   };
   if (!o.plain) {
     // The usual evasions open-source Meet bots ship with (instead of
     // puppeteer-extra-plugin-stealth, which is not a dependency here).
     args.push('--disable-blink-features=AutomationControlled');
-    opts.ignoreDefaultArgs = ['--enable-automation'];
+    opts.ignoreDefaultArgs.push('--enable-automation');
   }
   return opts;
 }
+
+/**
+ * Method "pulse": start a private PulseAudio whose only (so default) output is
+ * a null sink, so Chromium has a real audio device that pulls WebRTC playout
+ * (run 2: prejoin said "Speaker not found" and no inbound sample was ever
+ * decoded), and record the sink's monitor with parec to `wavPath` (16 kHz mono
+ * s16 WAV: ~1.9 MB/min). Returns { env, stop } — `env` for Chromium — or null
+ * when pulseaudio is not installed. The Jitsi recorder never uses this.
+ */
+async function startPulse(wavPath) {
+  const { spawn } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'spike-pulse-'));
+  const sock = path.join(dir, 'native');
+  const env = { ...process.env, HOME: dir, XDG_RUNTIME_DIR: dir, PULSE_RUNTIME_PATH: dir };
+  const procs = [];
+  const run = (cmd, args) => {
+    const p = spawn(cmd, args, { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    p.err = '';
+    p.stderr.on('data', (d) => (p.err = (p.err + d).slice(-500)));
+    p.on('error', (e) => (p.err = e.message));
+    procs.push(p);
+    return p;
+  };
+  const stop = async () => {
+    for (const p of procs.reverse()) {
+      if (p.exitCode !== null || p.signalCode) continue;
+      p.kill('SIGINT'); // parec finishes the WAV header on SIGINT
+      await new Promise((r) => {
+        p.once('exit', r);
+        setTimeout(r, 3000);
+      });
+      p.kill('SIGKILL');
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  };
+  // -n: no default.pa, so nothing but these two modules (no real hardware probing).
+  const pa = run('pulseaudio', ['-n', '--daemonize=no', '--exit-idle-time=-1', '--use-pid-file=no', '--log-target=stderr',
+    '-L', `module-native-protocol-unix socket=${sock} auth-anonymous=1`, '-L', 'module-null-sink sink_name=spike rate=48000']);
+  for (let i = 0; i < 50 && !fs.existsSync(sock) && pa.exitCode === null; i++) await sleep(100);
+  if (!fs.existsSync(sock)) {
+    log('pulse: unavailable', { err: pa.err.trim().split('\n').pop() });
+    await stop();
+    return null;
+  }
+  const server = `unix:${sock}`;
+  run('parec', ['-s', server, '-d', 'spike.monitor', '--rate=16000', '--channels=1', '--format=s16le', '--file-format=wav', wavPath]);
+  log('pulse: null sink up, recording its monitor');
+  return { env: { ...process.env, PULSE_SERVER: server }, stop };
+}
+
+/** Level of a 16-bit PCM WAV: overall RMS and the loudest 200 ms window, in
+ * dBFS (null = digital silence), plus its length. */
+function wavLevel(buf) {
+  const i = buf.indexOf('data');
+  if (buf.length < 44 || buf.toString('latin1', 0, 4) !== 'RIFF' || i < 0) return null;
+  const rate = buf.readUInt32LE(24);
+  const ch = buf.readUInt16LE(22);
+  const n = Math.floor((buf.length - i - 8) / 2);
+  const win = Math.max(1, Math.round(rate * ch * 0.2));
+  let sum = 0;
+  let wsum = 0;
+  let peak = 0;
+  for (let k = 0; k < n; k++) {
+    const v = buf.readInt16LE(i + 8 + k * 2) / 32768;
+    sum += v * v;
+    wsum += v * v;
+    if ((k + 1) % win === 0 || k === n - 1) {
+      peak = Math.max(peak, Math.sqrt(wsum / ((k % win) + 1)));
+      wsum = 0;
+    }
+  }
+  return { s: Math.round(n / ch / rate), rmsDb: db(n ? Math.sqrt(sum / n) : 0), peakDb: db(peak) };
+}
+
+const db = (rms) => (rms > 0 ? Number((20 * Math.log10(rms)).toFixed(1)) : null);
 
 async function login(o) {
   const puppeteer = require('puppeteer');
@@ -525,7 +680,10 @@ async function main() {
   fs.writeFileSync(logFile, '');
   const audioPath = path.join(o.outDir, 'mixed.webm');
   fs.writeFileSync(audioPath, '');
+  const tabPath = path.join(o.outDir, 'tab.webm');
+  fs.writeFileSync(tabPath, '');
   let audioBytes = 0;
+  let tabBytes = 0;
 
   let stop = null;
   process.on('SIGINT', () => {
@@ -538,8 +696,16 @@ async function main() {
     setTimeout(() => process.exit(130), 15000).unref();
   });
 
+  // Every capture method runs at once; the AUDIO line compares their levels.
+  const monitorPath = path.join(o.outDir, 'monitor.wav');
+  const pulse = await startPulse(monitorPath);
+  const peaks = { mix: 0, tab: 0, meetCtx: 0, taps: 0 };
+  let tabState = 'not started';
   const puppeteer = require('puppeteer');
-  const browser = await puppeteer.launch(launchOpts(o));
+  const browser = await puppeteer.launch({ ...launchOpts(o), env: pulse ? pulse.env : process.env }).catch(async (e) => {
+    if (pulse) await pulse.stop();
+    throw e;
+  });
   const summary = { mode: o.userDataDir ? 'signed-in profile' : 'anonymous guest', headless: !o.headful, plain: o.plain };
   try {
     const browserUA = await browser.userAgent();
@@ -550,6 +716,11 @@ async function main() {
       const buf = Buffer.from(b64, 'base64');
       audioBytes += buf.length;
       fs.appendFileSync(audioPath, buf);
+    });
+    await page.exposeFunction('__spikeTabChunk', (b64) => {
+      const buf = Buffer.from(b64, 'base64');
+      tabBytes += buf.length;
+      fs.appendFileSync(tabPath, buf);
     });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     await page.evaluateOnNewDocument(installHooks);
@@ -624,6 +795,8 @@ async function main() {
     summary.result = 'admitted';
     summary.admittedAfterS = Math.round((admittedAt - t0) / 1000);
     log('recorder start, AudioContext', await page.evaluate(startRecorder));
+    tabState = await page.evaluate(startTabCapture).catch((e) => 'error: ' + e.message);
+    log('tab capture', tabState);
     const cap = { st: { open: new Map(), done: new Set() }, on: false, region: false, strategy: null, blocks: 0, saved: 0, sampled: false };
     const capPath = path.join(o.outDir, 'captions.jsonl');
     const pollCaptions = async (flush) => {
@@ -662,13 +835,23 @@ async function main() {
         }
       }
       const m = await media();
+      peaks.mix = Math.max(peaks.mix, m.recRms || 0);
+      peaks.tab = Math.max(peaks.tab, m.tabRms || 0);
+      peaks.meetCtx = Math.max(peaks.meetCtx, m.tapRms || 0);
+      peaks.taps = Math.max(peaks.taps, m.taps || 0);
       log('media', {
         liveAudioTracks: m.liveAudio,
+        pcs: m.pcs,
+        outs: m.outs,
         ctx: m.ctx,
         inbound: m.inbound,
         meetEls: m.meetEls,
+        pageEls: m.pageEls,
         ourEls: m.ourEls,
         recRms: m.recRms,
+        tabRms: m.tabRms,
+        taps: m.taps,
+        tapRms: m.tapRms,
         recordedKB: Math.round(audioBytes / 1024),
         captions: cap.saved,
       });
@@ -690,6 +873,16 @@ async function main() {
   } finally {
     summary.audio = { path: audioPath, bytes: audioBytes };
     await browser.close().catch(() => {});
+    if (pulse) await pulse.stop();
+    // Per-method level in dBFS (null = digital silence): pulse = the null-sink
+    // monitor (monitor.wav), mix = the page-side MediaRecorder mix (mixed.webm,
+    // loudest 200 ms), tab = getDisplayMedia tab audio (tab.webm), meetCtx = taps on the page's own AudioContexts (no file).
+    log('AUDIO', {
+      pulse: pulse ? (fs.existsSync(monitorPath) && wavLevel(fs.readFileSync(monitorPath))) || 'no wav' : 'unavailable',
+      mix: { peakDb: db(peaks.mix), kB: Math.round(audioBytes / 1024) },
+      tab: { peakDb: db(peaks.tab), kB: Math.round(tabBytes / 1024), state: tabState.slice(0, 80) },
+      meetCtx: { peakDb: db(peaks.meetCtx), ctxs: peaks.taps },
+    });
     log('SUMMARY', summary);
   }
 }
@@ -703,4 +896,4 @@ if (require.main === module)
     },
   );
 
-module.exports = { parseArgs, foldCaptions, readState, readCaptions, installHooks, startRecorder, pollMedia, CAPTION_SETTLE_MS };
+module.exports = { parseArgs, foldCaptions, readState, readCaptions, installHooks, startRecorder, startTabCapture, pollMedia, startPulse, wavLevel, db, launchOpts, CAPTION_SETTLE_MS };

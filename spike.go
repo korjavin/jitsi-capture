@@ -27,11 +27,12 @@ const (
 	spikeCommand        = "meet-spike"
 	spikeDefaultSeconds = 90
 	spikeMaxSeconds     = 600
-	spikeJoinTimeoutS   = 300 // lobby wait, passed to the script as --join-timeout
-	spikeSlackS         = 90  // browser launch + shutdown on top of join + record
-	spikeLineMax        = 600 // per posted line; 15 lines + header stay under Zulip's 10k limit
-	spikeCaptionLines   = 20  // caption lines quoted in the DM; the rest is in captions.jsonl
-	spikeCaptionMax     = 300 // per quoted caption line
+	spikeJoinTimeoutS   = 300      // lobby wait, passed to the script as --join-timeout
+	spikeSlackS         = 90       // browser launch + shutdown on top of join + record
+	spikeLineMax        = 600      // per posted line; 15 lines + header stay under Zulip's 10k limit
+	spikeCaptionLines   = 20       // caption lines quoted in the DM; the rest is in captions.jsonl
+	spikeCaptionMax     = 300      // per quoted caption line
+	spikeUploadMax      = 24 << 20 // under Zulip's default 25 MB upload limit
 )
 
 var (
@@ -187,7 +188,9 @@ func (s *Spike) run(url string, seconds int, lang string) (report, captions stri
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "meet-spike finished, exit code %d (0 recorded, 2 bad args, 3 never admitted, 4 error, -1 timeout/shutdown)\n```text\n%s\n```\n", code, spikeLines(stderr.String()))
-	b.WriteString(s.upload("Audio", filepath.Join(outDir, "mixed.webm"), "meet-spike.webm"))
+	b.WriteString(s.upload("Audio", filepath.Join(outDir, "mixed.webm"), "meet-spike.webm") + "\n")
+	b.WriteString(s.upload("Monitor audio", filepath.Join(outDir, "monitor.wav"), "meet-spike-monitor.wav") + "\n")
+	b.WriteString(s.upload("Tab audio", filepath.Join(outDir, "tab.webm"), "meet-spike-tab.webm"))
 	return b.String(), s.captionsReport(filepath.Join(outDir, "captions.jsonl"))
 }
 
@@ -198,8 +201,12 @@ func (s *Spike) upload(what, path, name string) string {
 		return "No " + strings.ToLower(what) + " file."
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err != nil || fi.Size() == 0 {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
 		return what + " file is empty."
+	}
+	if fi.Size() > spikeUploadMax {
+		return fmt.Sprintf("%s file is %d MB, too big to upload; it stays in %s.", what, fi.Size()>>20, path)
 	}
 	ctx, cancel := context.WithTimeout(s.bg, 2*time.Minute)
 	defer cancel()
@@ -243,7 +250,7 @@ func (s *Spike) captionsReport(path string) string {
 }
 
 // spikeLines keeps the lines of the script's log the go/no-go report needs:
-// the last 8 STATE lines, the last 3 media and names samples, and SUMMARY (whose result field carries a fatal error).
+// the last 8 STATE lines, the last 2 media and names samples, pulse, AUDIO (the level per capture method) and SUMMARY (whose result field carries a fatal error).
 // Anything else (an argument error, a crash) falls back to the log's tail.
 func spikeLines(log string) string {
 	var states, media, names, rest, all []string
@@ -259,12 +266,12 @@ func spikeLines(log string) string {
 			media = append(media, l)
 		case strings.Contains(l, "] names "):
 			names = append(names, l)
-		case strings.Contains(l, "] SUMMARY"):
+		case strings.Contains(l, "] SUMMARY"), strings.Contains(l, "] AUDIO"), strings.Contains(l, "] pulse: "):
 			rest = append(rest, l)
 		}
 	}
 	tail := func(a []string, n int) []string { return a[max(0, len(a)-n):] }
-	out := append(append(append(tail(states, 8), tail(media, 3)...), tail(names, 3)...), rest...)
+	out := append(append(append(tail(states, 8), tail(media, 2)...), tail(names, 2)...), rest...)
 	if len(out) == 0 {
 		out = tail(all, 8)
 	}

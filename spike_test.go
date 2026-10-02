@@ -84,12 +84,13 @@ func TestSpikeRunsAndReportsBack(t *testing.T) {
 	}
 	report := replies[1]
 	for _, want := range []string{"exit code 0", "STATE - -> prejoin", "STATE prejoin -> admitted", `"liveAudioTracks":4`, "names", "SUMMARY",
-		"[meet-spike.webm](/user_uploads/1/ab/meet-spike.webm)"} {
+		"pulse: null sink up", `AUDIO {"pulse":{"s":9,"rmsDb":-17.1`,
+		"[meet-spike.webm](/user_uploads/1/ab/meet-spike.webm)", "Monitor audio: [meet-spike-monitor.wav](", "Tab audio file is empty."} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report misses %q:\n%s", want, report)
 		}
 	}
-	for _, unwanted := range []string{`"liveAudioTracks":1`, "noise", "launch"} {
+	for _, unwanted := range []string{`"liveAudioTracks":2`, "noise", "launch"} {
 		if strings.Contains(report, unwanted) {
 			t.Errorf("report should not carry %q:\n%s", unwanted, report)
 		}

@@ -35,12 +35,46 @@ with Puppeteer Chromium and logs what the go/no-go report needs:
   detached `<audio>` element: Chromium leaves a remote WebRTC track that only
   feeds WebAudio undecoded, which recorded digital silence in run 1.
 
+### Audio: three capture methods in one run
+
+Runs 1–2 recorded digital silence: inbound RTP flowed but `smp` stayed 0, and
+Meet's prejoin said "Speaker not found" (the container has no audio output
+device). Every run now tries all four at once, and the `AUDIO` line at the
+end gives each one's level in dBFS (`null` = digital silence):
+
+| Method | What | File |
+|---|---|---|
+| `pulse` | The script starts a private PulseAudio whose only output is a null sink, launches Chromium on it (`PULSE_SERVER`, without Puppeteer's default `--mute-audio`), and records the sink's monitor with `parec` — the PulseAudio + ffmpeg approach of most open-source and commercial meeting bots, with `parec` writing the WAV directly. Meet now sees one speaker. `rmsDb` is the whole file, `peakDb` the loudest 200 ms. | `monitor.wav` (16 kHz mono, ~1.9 MB/min) |
+| `mix` | The page-side mix above, now with a real output device present. `peakDb` = loudest 200 ms. | `mixed.webm` |
+| `tab` | Tab capture: `getDisplayMedia({audio: true, preferCurrentTab: true})` auto-accepted by `--auto-accept-this-tab-capture` (how screenappai/meeting-bot records Meet), recorded with MediaRecorder. `state` says whether it started. `peakDb` = loudest 200 ms. | `tab.webm` |
+| `meetCtx` | Taps on every AudioContext of the page's own (Meet's) that sends audio to its speakers: run 2 saw no `<audio>` elements, so Meet may play through WebAudio. `ctxs` = how many such contexts. Level only. | — |
+
+Extra diagnostics in the `media` lines: `tabRms` (the `tab` method), `pcs` (peer connections), `outs`
+(audio output devices the page sees; 0 = "Speaker not found"), `conc`
+(concealedSamples) and `jbe` (jitterBufferEmittedCount) per inbound SSRC,
+`pageEls` (media elements the page played a stream with, attached to the DOM
+or not), `taps`/`tapRms` (the `meetCtx` method). An `rtc` line per peer
+connection says whether Meet asked for encoded insertable streams
+(`encoded: true`). The bot DM uploads `mixed.webm`, `monitor.wav` and `tab.webm` (each up to 24 MB).
+
+`audio-check.js` exercises these paths offline, without Meet: a localhost page
+loops Chromium's fake microphone through two peer connections and plays the
+remote track through WebAudio, and the same hooks, recorder and null sink
+capture it.
+
+```bash
+docker run --rm --entrypoint node jitsi-capture /app/recorder/spike/audio-check.js            # with the null sink
+docker run --rm --entrypoint node jitsi-capture /app/recorder/spike/audio-check.js --no-pulse # without
+```
+
 The bot joins **without microphone or camera**: the script denies both
 permissions, so it cannot send audio into the call.
 
 Everything goes to `--out-dir` (default `./meet-spike-out`):
 - `spike.log`: the log;
-- `mixed.webm`: the audio;
+- `mixed.webm`: the page-side mix;
+- `monitor.wav`: the PulseAudio null-sink monitor (when `pulseaudio` is installed, as in the image);
+- `tab.webm`: the tab-capture audio;
 - `captions.jsonl`: the captions (with `--captions`);
 - a `NNNN-<state>.png` screenshot and a `.txt` page-text dump at every state
   change, and one every 30 s in the call.

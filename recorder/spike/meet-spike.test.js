@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 
 // Requiring must not launch a browser.
-const { parseArgs, foldCaptions, readState, CAPTION_SETTLE_MS } = require('./meet-spike.js');
+const { parseArgs, foldCaptions, readState, wavLevel, CAPTION_SETTLE_MS } = require('./meet-spike.js');
 
 const URL = 'https://meet.google.com/abc-defg-hij';
 
@@ -72,4 +72,24 @@ test('readState: the lobby text wins over a visible Leave call button', () => {
     delete global.document;
     delete global.location;
   }
+});
+
+test('wavLevel: silence is null, a constant half-scale signal is -6 dBFS, the loudest window wins', () => {
+  // 16 kHz mono s16 WAV, as parec writes it: 1 s of silence then 0.2 s at 0.5.
+  const wav = (samples) => {
+    const h = Buffer.alloc(44);
+    h.write('RIFF', 0, 'latin1');
+    h.write('WAVEfmt ', 8, 'latin1');
+    h.writeUInt16LE(1, 22);
+    h.writeUInt32LE(16000, 24);
+    h.write('data', 36, 'latin1');
+    const d = Buffer.alloc(samples.length * 2);
+    samples.forEach((v, i) => d.writeInt16LE(Math.round(v * 32767), i * 2));
+    return Buffer.concat([h, d]);
+  };
+  assert.deepStrictEqual(wavLevel(wav(new Array(16000).fill(0))), { s: 1, rmsDb: null, peakDb: null });
+  const l = wavLevel(wav([...new Array(16000).fill(0), ...new Array(3200).fill(0.5)]));
+  assert.strictEqual(l.peakDb, -6);
+  assert.ok(l.rmsDb < -13 && l.rmsDb > -15, `rmsDb ${l.rmsDb}`);
+  assert.strictEqual(wavLevel(Buffer.from('not a wav')), null);
 });
