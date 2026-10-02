@@ -9,9 +9,9 @@ COPY *.go ./
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /jitsi-capture .
 
 FROM node:22-bookworm-slim
-# pulseaudio + pulseaudio-utils (parec): only the Meet spike starts a null-sink
-# PulseAudio (recorder/spike/meet-spike.js); record.js never does, and nothing
-# autospawns it. ~130 MB. ponytail: drop them with the spike if Meet goes no-go.
+# pulseaudio + pulseaudio-utils (parec): recorder/meet.js starts its own null-sink
+# PulseAudio per Meet job and records it with parec; record.js never does, and
+# nothing autospawns it. ~130 MB.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium pulseaudio pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*

@@ -24,7 +24,6 @@ type Bot struct {
 	jitsiRe *regexp.Regexp
 	name    string          // BOT_DISPLAY_NAME, for the Meet "admit me" reply
 	start   func(Job) error // the runner's Start; a plain func value is the seam
-	spike   func(Message)   // a "meet-spike ..." DM; nil disables the command
 }
 
 // meetRe matches a Google Meet link and captures its meeting code (three groups
@@ -109,10 +108,6 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 	case ev.Type == "message" && ev.Message != nil:
 		m := ev.Message
 		if m.SenderID == b.botID {
-			return
-		}
-		if m.Type == "private" && b.spike != nil && strings.HasPrefix(strings.TrimSpace(m.Content), spikeCommand) {
-			b.spike(*m)
 			return
 		}
 		// Meet is DM-only: a Meet link in a stream gets no reaction and no job.

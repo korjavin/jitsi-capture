@@ -77,20 +77,6 @@ tracks); the transcriber must decode WAV as well as WebM/Opus — confirm that
 before deploying. Everything else (🔴, failure notes, webhook, retention) is the
 Jitsi flow.
 
-**Google Meet spike (diagnostic).** DM the bot
-`meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N] [lang=<code>]`
-(default 90, max 600) to run [`recorder/spike/meet-spike.js`](recorder/spike/README.md) from
-the deployed container: it joins as an anonymous guest (headless, captions on),
-waits up to 300 s in the lobby for someone to admit it, then records N seconds.
-`lang=` (e.g. `lang=de-DE`) tries to set Meet's caption language; Meet captions
-one spoken language per meeting, so mixed-language calls caption badly.
-The bot (with a silent fake mic and black fake camera, both switched off before joining) replies at once, then posts the `STATE`/`devices`/`media`/`rtp`/`names`/`AUDIO`/`SUMMARY` lines
-and links to the audio (`mixed.webm`, the page-side mix, `monitor.wav`, a PulseAudio null-sink recording, and `tab.webm`, a tab capture; `AUDIO` gives each capture method's level and speech-like fraction) plus the full `spike.log` into the same DM, then a third message with the
-first 20 caption lines (`speaker: text`) and a link to `captions.jsonl`. One run at a time — a second
-request gets `busy`. Files stay under `DATA_DIR/spike/<timestamp>/` (not swept
-by retention). Guest mode only: a signed-in bot account needs a hand sign-in a
-headless container cannot do.
-
 Failures are reported as one English line in the job's topic (or DM):
 
 | cause | message |
