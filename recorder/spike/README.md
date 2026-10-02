@@ -57,18 +57,74 @@ or not), `taps`/`tapRms` (the `meetCtx` method). An `rtc` line per peer
 connection says whether Meet asked for encoded insertable streams
 (`encoded: true`). The bot DM uploads `mixed.webm`, `monitor.wav` and `tab.webm` (each up to 24 MB).
 
-`audio-check.js` exercises these paths offline, without Meet: a localhost page
-loops Chromium's fake microphone through two peer connections and plays the
-remote track through WebAudio, and the same hooks, recorder and null sink
-capture it.
+`audio-check.js` exercises these paths offline, without Meet: it launches
+Chromium with the same fake devices as a Meet run, a localhost page loops a
+beeping WebAudio tone through two peer connections and plays the remote
+track through WebAudio, and the same hooks, recorder and null sink capture it.
 
 ```bash
 docker run --rm --entrypoint node jitsi-capture /app/recorder/spike/audio-check.js            # with the null sink
 docker run --rm --entrypoint node jitsi-capture /app/recorder/spike/audio-check.js --no-pulse # without
 ```
 
-The bot joins **without microphone or camera**: the script denies both
-permissions, so it cannot send audio into the call.
+### Devices: fake, silent, and switched off (v4)
+
+Run 3 showed call audio never reaching the decoder while prejoin said "Mic not
+found / Speaker not found": the guest had no devices and no permissions. The
+bot now looks like a person's browser with its mic and camera off:
+
+- Chromium gets `--use-fake-ui-for-media-stream --use-fake-device-for-media-stream`
+  with `--use-file-for-fake-audio-capture=<out>/fake-mic-silence.wav` (2 s of
+  digital silence, looped) and `--use-file-for-fake-video-capture=<out>/fake-cam-black.y4m`
+  (one black frame), and Meet's origin is granted `camera` + `microphone`.
+  The page then sees 3 audio inputs, 1 video input and 3 audio outputs, even
+  without PulseAudio.
+- On the prejoin screen the script clicks every "Turn off microphone/camera"
+  toggle and **never clicks join while either still reads on**. It checks
+  again every 5 s in the call (`devices` lines: `mic`/`cam` = `on`/`off`/`?`,
+  the enumerateDevices counts, permission states, and the page's own phrases
+  about mic/camera/speaker).
+- Belt and braces: every `getUserMedia` track is disabled and its `enabled`
+  property is locked (Meet setting it to `true` is a no-op), so even a leaked
+  track carries silence or a black frame. `devices in-call` lists every
+  sender track and the bytes sent per kind.
+
+Other bots: attendee and Vexa also pass `--use-fake-ui-for-media-stream`
+(attendee adds `--use-fake-device-for-media-stream`; Vexa points the fake
+camera at `/dev/null`) and turn the mic/camera off by their
+`aria-label="Turn off ..."` buttons; screenappai/meeting-bot grants nothing
+for Meet and clicks "Continue without microphone and camera".
+
+**Caveat:** under `--use-fake-device-for-media-stream`, `getDisplayMedia`
+returns Chromium's fake capture too, so the `tab` method records "Fake audio",
+not Meet (its `state` shows the track labels). `pulse` already records
+everything the browser plays, which includes the tab. (The pre-v4 offline
+check had the same flag, so its `tab` level was the fake beep as well.)
+
+More v4 diagnostics:
+
+- `rtp` every second in the call: inbound bytes per second per peer
+  connection and SSRC (`a…` audio, `v…` video) plus bytes sent; `rtp
+  transceivers` whenever they change (mid, direction, what each receiver and
+  sender holds).
+- `meet audio`: Meet's own `<audio>` elements (muted, `muted` attribute,
+  paused, volume, sinkId, track state) right after admission, where muted
+  ones get unmuted (local playback only), and again 10 s later.
+- `audio settings`: the text of Meet's Settings -> Audio dialog (selected
+  speaker/microphone).
+- `captions lang:` logs every step of the language switch (now opening the
+  language list first, and listing the options on screen when the wanted one
+  is missing), then whether captions are still on (`after switch`; if not,
+  they are turned back on). `captions text` every 5 s: the raw caption
+  region text (200 chars) and the block count.
+- `AUDIO` gives each method a `speech` value: the fraction of seconds above
+  -45 dBFS (pulse: the whole file; the others: since admission). Join chimes
+  light up a second or two; speech lights up many.
+- The bot DM uploads the whole `spike.log` too.
+
+`audio-check.js` also proves the device setup offline: the fake mic file read
+on a page without the hooks is digital silence, and on a hooked page the
+tracks stay disabled after `enabled = true`.
 
 Everything goes to `--out-dir` (default `./meet-spike-out`):
 - `spike.log`: the log;

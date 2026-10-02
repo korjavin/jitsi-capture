@@ -17,6 +17,11 @@ echo '[+2.0s] STATE - -> prejoin {"why":"ask to join"}' >&2
 echo '[+9.0s] STATE prejoin -> admitted {"why":"Leave call button"}' >&2
 for i in 1 2 3 4; do echo "[+1$i.0s] media {\"liveAudioTracks\":$i}" >&2; done
 echo '[+15.0s] names {"tiles":["Alice"]}' >&2
+echo '[+15.0s] devices in-call {"mic":"off","cam":"off"}' >&2
+for i in 1 2; do echo "[+1$i.5s] rtp {\"in\":{\"0\":{\"a1\":$i}}}" >&2; done
+echo '[+15.5s] rtp transceivers [{"pc":0}]' >&2
+echo '[+16.0s] captions text {"text":"Alice Hello"}' >&2
+printf 'full log' >"$out/spike.log"
 echo '[+16.0s] noise that is not reported' >&2
 printf 'fake-audio' >"$out/mixed.webm"
 printf 'fake-wav' >"$out/monitor.wav"
