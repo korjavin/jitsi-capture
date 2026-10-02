@@ -621,9 +621,11 @@ func TestRunFailures(t *testing.T) {
 			if got.State != JobFailed || got.Error != tc.wantErr {
 				t.Errorf("state = %q error = %q, want failed/%s", got.State, got.Error, tc.wantErr)
 			}
-			if msgs := z.messages(); len(msgs) != 1 || msgs[0] != failNote[tc.wantErr] {
-				t.Errorf("notes = %v, want %q", msgs, failNote[tc.wantErr])
-			}
+			// The note follows the save waitSettled saw, so poll for it.
+			eventually(t, fmt.Sprintf("the note %q", failNote[tc.wantErr]), func() bool {
+				msgs := z.messages()
+				return len(msgs) == 1 && msgs[0] == failNote[tc.wantErr]
+			})
 			waitReactionRemoved(t, z, job.MessageID)
 			select {
 			case j := <-finished:
