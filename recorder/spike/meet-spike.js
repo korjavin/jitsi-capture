@@ -96,7 +96,15 @@ function foldCaptions(st, blocks, now, flush = false) {
   };
   const present = new Set();
   for (const b of blocks) {
-    if (!b.text || st.done.has(b.id)) continue;
+    if (!b.text) {
+      // Still on screen but cleared: its turn is over and Meet may reuse the
+      // element for the next one, so its id may start a new utterance.
+      present.add(b.id);
+      if (st.open.has(b.id)) final(b.id);
+      st.done.delete(b.id);
+      continue;
+    }
+    if (st.done.has(b.id)) continue;
     present.add(b.id);
     const u = st.open.get(b.id);
     if (!u) st.open.set(b.id, { speaker: b.name || '?', text: b.text, first: now, changed: now });
@@ -108,7 +116,8 @@ function foldCaptions(st, blocks, now, flush = false) {
       Object.assign(u, { speaker: b.name || u.speaker, text: b.text, changed: now });
     }
   }
-  const newest = blocks.length ? blocks[blocks.length - 1].id : null;
+  const withText = blocks.filter((b) => b.text);
+  const newest = withText.length ? withText[withText.length - 1].id : null;
   for (const [id, u] of [...st.open]) {
     if (flush || !present.has(id) || (id !== newest && now - u.changed >= CAPTION_SETTLE_MS)) final(id);
   }
@@ -313,9 +322,9 @@ function readCaptions() {
         text: [...e.children].slice(1).map(txt).filter(Boolean).join(' '),
       }));
   }
-  blocks = blocks.filter((b) => b.text);
+  // Text-less blocks stay: a cleared block on screen differs from one that left (foldCaptions).
   // Region with text but nothing parsed: a markup sample to fix the selectors.
-  const sample = !blocks.length && txt(region) ? region.innerHTML.slice(0, 600) : null;
+  const sample = !blocks.some((b) => b.text) && txt(region) ? region.innerHTML.slice(0, 600) : null;
   return { region: true, strategy, blocks, sample };
 }
 
@@ -614,6 +623,8 @@ async function main() {
     const capPath = path.join(o.outDir, 'captions.jsonl');
     const pollCaptions = async (flush) => {
       const r = await page.evaluate(readCaptions).catch((e) => ({ region: false, strategy: null, blocks: [], error: e.message }));
+      // A failed read is not "every block left": keep the open lines for the next poll.
+      if (r.error && !flush) return;
       Object.assign(cap, { region: r.region, strategy: r.strategy, blocks: r.blocks.length });
       if (r.sample && !cap.sampled) {
         cap.sampled = true;

@@ -43,6 +43,16 @@ test('foldCaptions splits a block Meet restarts, and flush drains the rest', () 
   assert.deepStrictEqual(foldCaptions(st, [], 2000, true), []);
 });
 
+test('foldCaptions: a block cleared on screen ends its turn and may start another', () => {
+  const st = { open: new Map(), done: new Set() };
+  foldCaptions(st, [{ id: '3', name: 'Ann', text: 'first turn' }], 0);
+  const end = foldCaptions(st, [{ id: '3', name: 'Ann', text: '' }], 1000);
+  assert.deepStrictEqual(end.map((u) => u.text), ['first turn']);
+  foldCaptions(st, [{ id: '3', name: 'Ann', text: 'second turn' }], 2000);
+  const rest = foldCaptions(st, [], 3000, true);
+  assert.deepStrictEqual(rest.map((u) => u.text), ['second turn']);
+});
+
 test('readState: the lobby text wins over a visible Leave call button', () => {
   const page = (text, leave) => {
     global.location = { host: 'meet.google.com', origin: 'https://meet.google.com', pathname: '/abc-defg-hij' };
