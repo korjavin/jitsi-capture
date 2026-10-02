@@ -242,3 +242,30 @@ func TestHostPath(t *testing.T) {
 		}
 	}
 }
+
+// A Meet job keeps its URL in jitsi_url (so the receivers need no change) and
+// says what it is in "source"; a Jitsi payload carries no source key at all.
+func TestBuildPayloadSource(t *testing.T) {
+	cfg := webhookConfig("http://unused.invalid")
+	jitsi, err := json.Marshal(buildPayload(cfg, finishedJob()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(jitsi, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["source"]; ok {
+		t.Errorf("jitsi payload has a source key: %s", jitsi)
+	}
+
+	job := finishedJob()
+	job.Stream, job.Topic, job.DMUserID = "", "", 7
+	job.JitsiURL, job.Source = "https://meet.google.com/abc-defg-hij", SourceMeet
+	job.AudioPath, job.Tracks = "/data/jobs/42/audio.wav", nil
+	p := buildPayload(cfg, job)
+	if p.Source != "meet" || p.JitsiURL != job.JitsiURL || p.AudioPath != "/srv/capture/jobs/42/audio.wav" ||
+		p.DMUserID != 7 || p.Tracks != nil {
+		t.Errorf("meet payload = %+v", p)
+	}
+}

@@ -22,13 +22,20 @@ type Bot struct {
 	z       *Zulip
 	botID   int64
 	jitsiRe *regexp.Regexp
+	name    string          // BOT_DISPLAY_NAME, for the Meet "admit me" reply
 	start   func(Job) error // the runner's Start; a plain func value is the seam
 	spike   func(Message)   // a "meet-spike ..." DM; nil disables the command
 }
 
+// meetRe matches a Google Meet link and captures its meeting code (three groups
+// of lowercase letters, 3-4-3). The job URL is rebuilt from the code alone, so a
+// query string (authuser, pli, ...) never reaches the job record or the logs.
+var meetRe = regexp.MustCompile(`https://meet\.google\.com/([a-z]{3}-[a-z]{4}-[a-z]{3})\b`)
+
 func newBot(cfg Config, z *Zulip, start func(Job) error) *Bot {
 	return &Bot{
 		z:     z,
+		name:  cfg.BotDisplayName,
 		start: start,
 		// Zulip's call button posts "[Join video call.](<base>/<room>)" — the raw
 		// content is enough, no markdown parsing needed. The room segment runs to
@@ -108,6 +115,13 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 			b.spike(*m)
 			return
 		}
+		// Meet is DM-only: a Meet link in a stream gets no reaction and no job.
+		if m.Type == "private" {
+			if code := meetRe.FindStringSubmatch(m.Content); code != nil {
+				b.startMeet(ctx, *m, code[1])
+				return
+			}
+		}
 		if !b.jitsiRe.MatchString(m.Content) {
 			return
 		}
@@ -169,6 +183,30 @@ func (b *Bot) startJob(m Message, userID int64) {
 	// click on a live recording is a silent no-op for the user.
 	if err := b.start(job); err != nil && !errors.Is(err, ErrDuplicateJob) {
 		slog.Error("starting the recording failed", "job", job.ID, "err", err)
+	}
+}
+
+// startMeet starts a guest recording of the Meet call with this code, requested
+// by DM. Meet holds a guest in the lobby until somebody admits it, and nothing
+// on the call side says so, hence the one reply telling the sender what to do.
+func (b *Bot) startMeet(ctx context.Context, m Message, code string) {
+	job := Job{
+		ID:        strconv.FormatInt(m.ID, 10),
+		MessageID: m.ID,
+		DMUserID:  m.SenderID,
+		JitsiURL:  "https://meet.google.com/" + code,
+		Source:    SourceMeet,
+	}
+	slog.Info("meet recording requested", "job", job.ID, "user_id", m.SenderID, "room", code)
+	if err := b.start(job); err != nil {
+		if !errors.Is(err, ErrDuplicateJob) {
+			slog.Error("starting the recording failed", "job", job.ID, "err", err)
+		}
+		return
+	}
+	text := "Asking to join " + code + " as a guest — admit " + b.name + " from the lobby."
+	if err := b.z.Reply(ctx, job, text); err != nil {
+		slog.Error("posting the meet admit reply", "job", job.ID, "err", err)
 	}
 }
 

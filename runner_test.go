@@ -636,6 +636,64 @@ func TestRunFailures(t *testing.T) {
 	}
 }
 
+func meetJob() Job {
+	return Job{ID: "43", MessageID: 43, DMUserID: 7, JitsiURL: "https://meet.google.com/abc-defg-hij", Source: SourceMeet}
+}
+
+// A Meet job runs meet.js next to RECORDER_PATH with the record.js flags minus
+// --tracks-dir (the fake exits 2 on it), the Meet join timeout, and a WAV.
+func TestRunMeetSuccess(t *testing.T) {
+	r, z, finished := newTestRunner(t, "rec_ok.sh")
+	r.cfg.MeetJoinTimeoutS = 1200
+	job := meetJob()
+	if err := r.Start(job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var got Job
+	select {
+	case got = <-finished:
+	case <-time.After(15 * time.Second):
+		t.Fatal("onFinished was never called")
+	}
+	wantAudio := filepath.Join(jobDir(r.cfg.DataDir, job.ID), "audio.wav")
+	if got.State != JobFinished || got.Source != SourceMeet || got.AudioPath != wantAudio ||
+		got.DurationS != 90 || got.Tracks != nil || got.DMUserID != 7 {
+		t.Errorf("job = %+v", got)
+	}
+	args, err := os.ReadFile(wantAudio + ".args")
+	if err != nil {
+		t.Fatalf("fake meet.js args: %v", err)
+	}
+	want := "--url https://meet.google.com/abc-defg-hij --out " + wantAudio +
+		" --join-timeout 1200 --max-duration 14400 --empty-grace 60 --display-name NoteTaker\n"
+	if string(args) != want {
+		t.Errorf("meet.js args = %q, want %q", args, want)
+	}
+	if saved := waitSettled(t, r.cfg.DataDir, job.ID); saved.Source != SourceMeet {
+		t.Errorf("job.json source = %q, want meet", saved.Source)
+	}
+	waitReactionRemoved(t, z, job.MessageID)
+	if msgs := z.messages(); len(msgs) != 0 {
+		t.Errorf("a success posted a note: %v", msgs)
+	}
+}
+
+func TestRunMeetNotAdmitted(t *testing.T) {
+	t.Setenv("FAKE_MEET_EXIT", "3")
+	r, z, _ := newTestRunner(t, "rec_ok.sh")
+	job := meetJob()
+	if err := r.Start(job); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := waitSettled(t, r.cfg.DataDir, job.ID); got.State != JobFailed || got.Error != errNotAdmitted {
+		t.Errorf("state = %q error = %q, want failed/%s", got.State, got.Error, errNotAdmitted)
+	}
+	eventually(t, "the not_admitted note", func() bool {
+		msgs := z.messages()
+		return len(msgs) == 1 && msgs[0] == failNote[errNotAdmitted]
+	})
+}
+
 // Stop must cover a job accepted a moment earlier and must not return until
 // that job's final state is on disk — otherwise the next Resume would mark a
 // finished recording as interrupted.

@@ -143,7 +143,11 @@ func (r *Runner) admit(job *Job) (*recording, error) {
 	job.EndedAt = nil
 	job.DurationS = 0
 	job.WebhookSentAt = nil
-	job.AudioPath = filepath.Join(jobDir(r.cfg.DataDir, job.ID), "audio.webm")
+	audio := "audio.webm"
+	if job.Source == SourceMeet {
+		audio = "audio.wav" // meet.js records the PulseAudio monitor as 16 kHz mono WAV
+	}
+	job.AudioPath = filepath.Join(jobDir(r.cfg.DataDir, job.ID), audio)
 	if err := job.save(r.cfg.DataDir); err != nil {
 		return nil, err
 	}
@@ -170,17 +174,7 @@ func (r *Runner) run(job Job, rec *recording) {
 	// the child spawns, so a recorder that dies at once finds it there to clear.
 	r.syncIndicator(job, slog.LevelError)
 
-	cmd := exec.Command(nodeBin, r.cfg.RecorderPath,
-		"--url", job.JitsiURL,
-		"--out", job.AudioPath,
-		// Per-participant audio next to the mixed file; the recorder reports the
-		// files it wrote back in the stdout JSON as tracks[].
-		"--tracks-dir", filepath.Join(jobDir(r.cfg.DataDir, job.ID), "tracks"),
-		"--join-timeout", strconv.Itoa(r.cfg.JoinTimeoutS),
-		"--max-duration", strconv.Itoa(r.cfg.MaxDurationS),
-		"--empty-grace", strconv.Itoa(r.cfg.EmptyGraceS),
-		"--display-name", r.cfg.BotDisplayName,
-	)
+	cmd := exec.Command(nodeBin, r.recorderArgs(job)...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
@@ -233,6 +227,29 @@ func (r *Runner) run(job Job, rec *recording) {
 		}
 	}
 	r.settle(job)
+}
+
+// recorderArgs is the recorder command line. A Meet job runs meet.js, the
+// sibling of RECORDER_PATH, with the same flags minus --tracks-dir (Meet has no
+// per-participant audio) and with the longer MEET_JOIN_TIMEOUT_S.
+func (r *Runner) recorderArgs(job Job) []string {
+	common := func(script string, joinTimeout int) []string {
+		return []string{script,
+			"--url", job.JitsiURL,
+			"--out", job.AudioPath,
+			"--join-timeout", strconv.Itoa(joinTimeout),
+			"--max-duration", strconv.Itoa(r.cfg.MaxDurationS),
+			"--empty-grace", strconv.Itoa(r.cfg.EmptyGraceS),
+			"--display-name", r.cfg.BotDisplayName,
+		}
+	}
+	if job.Source == SourceMeet {
+		return common(filepath.Join(filepath.Dir(r.cfg.RecorderPath), "meet.js"), r.cfg.MeetJoinTimeoutS)
+	}
+	// Per-participant audio next to the mixed file; the recorder reports the
+	// files it wrote back in the stdout JSON as tracks[].
+	return append(common(r.cfg.RecorderPath, r.cfg.JoinTimeoutS),
+		"--tracks-dir", filepath.Join(jobDir(r.cfg.DataDir, job.ID), "tracks"))
 }
 
 // settle persists the job and announces the outcome, then hands a finished job
