@@ -216,6 +216,68 @@ The record phase polls every 2 s and stops on the first of:
 
 The decision itself is the pure, unit-tested `shouldStop()`.
 
+## Google Meet (`meet.js`)
+
+`meet.js` records a Google Meet call with the **same contract** as `record.js`,
+so the caller service drives either one the same way:
+
+```bash
+node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav> \
+  [--join-timeout <sec, default 1200>] \
+  [--max-duration <sec, default 14400>] \
+  [--empty-grace <sec, default 60>] \
+  [--display-name <str, default NoteTaker>] \
+  [--tracks-dir <dir>]   # accepted and ignored
+```
+
+* **Same** exit codes (0 / 2 / 3 / 4 / 5), signals (`SIGTERM`/`SIGINT` stop
+  gracefully with `"reason":"signal"` and exit 0; a second one exits at once),
+  and stderr milestones (`joining room <meeting-code> as <name>`,
+  `state: waiting_in_lobby`, `state: joined`, `stopping: <reason>`, `wrote …`).
+  Only the meeting code is logged, never the URL.
+* **stdout**: `{"out","duration_s","reason","participants"}` — never `tracks`:
+  Meet sends a few mixed loudest-speaker streams, no per-participant audio.
+  `reason` is `empty_room` | `max_duration` | `signal` | `ended` (the meeting
+  ended or the host ended it for everyone) | `removed` (the bot was removed).
+  `duration_s` is the length of the audio in the WAV.
+* **Output**: WAV, 16 kHz mono s16le (~1.9 MB/min), not WebM/Opus — the
+  downstream transcriber must accept it. Recording starts at admission.
+* **Guest only**: no Google account. The bot types `--display-name`, switches
+  Meet's mic and camera off (it never knocks while either reads on), clicks
+  *Ask to join* and waits in the lobby. Exit 3 when the host denies it, the
+  meeting refuses guests ("You can't join this video call"), the code is
+  invalid, a sign-in page appears, or `--join-timeout` passes without
+  admission.
+* **Before the call**: knocking on a meeting nobody has opened yet ends in "No
+  one responded to your request". The bot re-knocks (reload + *Ask to join*)
+  every 60 s, logging `state: waiting_in_lobby (no one responded; re-knock N)`,
+  until admitted or `--join-timeout`. Nobody admitting it at all is exit 3.
+* **Stopping**: like `record.js`, plus `ended`/`removed`. The empty-room rule
+  counts the participant names visible on the video tiles (and the people
+  panel when open), bot excluded; when no tile or no name can be read the roster
+  counts as unknown, never as empty, so a Meet markup change cannot cut a call
+  short — it falls back to `--max-duration` instead. The Meet page closing or
+  crashing mid-call, or `parec`/PulseAudio exiting, is exit 5 (truncated).
+
+How the audio is captured — the only method the Meet spike found working:
+Meet plays call audio only to a participant that has media devices. Chromium
+gets a fake mic (a silent WAV) and a fake camera (one black frame), with the
+prompts auto-accepted; the bot switches both off before joining and re-checks
+the toggles every 10 s in the call, and every captured track is disabled and
+locked page-side, so **nothing is ever sent into the call**. Each run starts
+its own PulseAudio (in a fresh temp dir, so concurrent jobs never share one)
+whose only output is a null sink; Chromium plays the call into it and `parec`
+records the sink's monitor into `--out`. `parec` is stopped with `SIGINT`,
+which writes the final WAV header; the header is re-checked afterwards
+regardless. Both children are killed on every exit path. Needs `pulseaudio`
+and `pulseaudio-utils` in the image. Page-side capture (WebAudio/MediaRecorder
+on the RTP tracks, tab capture) does not work on Meet.
+
+Every Meet DOM read and phrase lives in one page-side block in `meet.js`
+(`readState`, `prejoin`, `clickJoin`, `readNames`), English UI forced. Google
+changes them without notice; the block carries the date it was last checked
+live.
+
 ## Tests
 
 ```bash
@@ -227,3 +289,17 @@ npm test        # node --check record.js && node --test
 helpers (`trackFile`, `applyTrackEvents`, `toJsonl`, `manifestRow`,
 `resultLine`) are exported and covered. No browser is launched and no network is
 touched; the browser paths are verified manually against a throwaway room.
+
+`meet.test.js` covers `meet.js`'s argument parsing, Meet state matching
+(against a stubbed DOM), the stop rule and the WAV finalization offline. Its
+two end-to-end tests run `main()` with real Chromium, PulseAudio and `parec`
+against a fake Meet page served by request interception (no network): the page
+plays a tone over a WebRTC track the way Meet does, refuses the bot if it
+knocks with the mic or camera on or a captured track can be re-enabled, and the
+tests check the WAV level, header and stdout line after `SIGTERM` and after an
+empty room, and exit 5 when the page dies mid-call. They skip without Chromium/pulseaudio (the CI node job) and run in
+the Docker image, which CI does:
+
+```bash
+docker run --rm --shm-size=512m --entrypoint node jitsi-capture --test recorder/meet.test.js
+```
