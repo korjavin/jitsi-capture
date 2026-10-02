@@ -70,8 +70,8 @@ the deployed container: it joins as an anonymous guest (headless, captions on),
 waits up to 300 s in the lobby for someone to admit it, then records N seconds.
 `lang=` (e.g. `lang=de-DE`) tries to set Meet's caption language; Meet captions
 one spoken language per meeting, so mixed-language calls caption badly.
-The bot replies at once, then posts the `STATE`/`media`/`names`/`SUMMARY` lines
-and a link to the mixed audio into the same DM, then a third message with the
+The bot replies at once, then posts the `STATE`/`media`/`names`/`AUDIO`/`SUMMARY` lines
+and links to the audio (`mixed.webm`, the page-side mix, `monitor.wav`, a PulseAudio null-sink recording, and `tab.webm`, a tab capture; `AUDIO` gives each capture method's level) into the same DM, then a third message with the
 first 20 caption lines (`speaker: text`) and a link to `captions.jsonl`. One run at a time — a second
 request gets `busy`. Files stay under `DATA_DIR/spike/<timestamp>/` (not swept
 by retention). Guest mode only: a signed-in bot account needs a hand sign-in a
