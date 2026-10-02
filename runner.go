@@ -143,6 +143,7 @@ func (r *Runner) admit(job *Job) (*recording, error) {
 	job.EndedAt = nil
 	job.DurationS = 0
 	job.WebhookSentAt = nil
+	job.CaptionsPath = ""
 	audio := "audio.webm"
 	if job.Source == SourceMeet {
 		audio = "audio.wav" // meet.js records the PulseAudio monitor as 16 kHz mono WAV
@@ -224,6 +225,7 @@ func (r *Runner) run(job Job, rec *recording) {
 			job.DurationS = res.DurationS
 			job.Participants = res.Participants
 			job.Tracks = res.Tracks
+			job.CaptionsPath = res.Captions
 		}
 	}
 	r.settle(job)
@@ -231,7 +233,8 @@ func (r *Runner) run(job Job, rec *recording) {
 
 // recorderArgs is the recorder command line. A Meet job runs meet.js, the
 // sibling of RECORDER_PATH, with the same flags minus --tracks-dir (Meet has no
-// per-participant audio) and with the longer MEET_JOIN_TIMEOUT_S.
+// per-participant audio), with the longer MEET_JOIN_TIMEOUT_S, and with
+// --captions-out for the caption speaker hints next to the audio.
 func (r *Runner) recorderArgs(job Job) []string {
 	common := func(script string, joinTimeout int) []string {
 		return []string{script,
@@ -244,7 +247,8 @@ func (r *Runner) recorderArgs(job Job) []string {
 		}
 	}
 	if job.Source == SourceMeet {
-		return common(filepath.Join(filepath.Dir(r.cfg.RecorderPath), "meet.js"), r.cfg.MeetJoinTimeoutS)
+		return append(common(filepath.Join(filepath.Dir(r.cfg.RecorderPath), "meet.js"), r.cfg.MeetJoinTimeoutS),
+			"--captions-out", filepath.Join(jobDir(r.cfg.DataDir, job.ID), "captions.jsonl"))
 	}
 	// Per-participant audio next to the mixed file; the recorder reports the
 	// files it wrote back in the stdout JSON as tracks[].
@@ -564,6 +568,7 @@ type recResult struct {
 	Reason       string   `json:"reason"`
 	Participants []string `json:"participants"`
 	Tracks       []Track  `json:"tracks"`
+	Captions     string   `json:"captions"` // meet.js: the speaker-hint JSONL, only when non-empty
 }
 
 // parseResult reads the last non-empty line of the recorder's stdout as JSON.

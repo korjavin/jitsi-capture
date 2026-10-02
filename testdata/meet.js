@@ -2,13 +2,16 @@
 # Fake recorder/meet.js for runner_test.go (a shell script despite the name: the
 # runner finds meet.js next to RECORDER_PATH, and tests run it with sh). Writes
 # its arguments to <out>.args, a WAV-named --out and the final JSON line without
-# tracks. FAKE_MEET_EXIT=3 plays a guest nobody admitted.
+# tracks. With --captions-out it writes one speaker hint there and reports it as
+# "captions". FAKE_MEET_EXIT=3 plays a guest nobody admitted.
 set -e
 
 out=""
+captions=""
 prev=""
 for a in "$@"; do
 	[ "$prev" = "--out" ] && out="$a"
+	[ "$prev" = "--captions-out" ] && captions="$a"
 	if [ "$a" = "--tracks-dir" ]; then
 		echo "fake meet: the runner passed --tracks-dir" >&2
 		exit 2
@@ -25,4 +28,9 @@ mkdir -p "$(dirname "$out")"
 echo "$@" >"$out.args"
 echo "fake meet: joined" >&2
 printf 'RIFF-fake-wav' >"$out"
-printf '{"out":"%s","duration_s":90,"reason":"ended","participants":["Alice"]}\n' "$out"
+if [ -n "$captions" ]; then
+	printf '{"offset_s":1.5,"speaker":"Alice","text":"Hello"}\n' >"$captions"
+	printf '{"out":"%s","duration_s":90,"reason":"ended","participants":["Alice"],"captions":"%s"}\n' "$out" "$captions"
+else
+	printf '{"out":"%s","duration_s":90,"reason":"ended","participants":["Alice"]}\n' "$out"
+fi
