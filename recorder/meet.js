@@ -7,7 +7,7 @@
 // knocks, waits in the lobby, and records the call audio as a 16 kHz mono WAV.
 // See recorder/README.md, "Google Meet (meet.js)".
 //
-// How the audio is captured (proven live in the Meet spike, runs 4-5): Meet
+// How the audio is captured (proven in live Meet tests): Meet
 // only plays call audio to a participant that has media devices, so Chromium
 // gets a fake silent mic and a fake black camera, both switched off before
 // joining; it plays the call into a private PulseAudio null sink, and parec
@@ -155,8 +155,8 @@ function captionHint(u, startedAt, prev) {
 // serializes them). Meet's markup is obfuscated and changes without notice, so
 // a Meet UI change stays a fix in this block. English UI is forced at launch;
 // every phrase is English.
-// Last checked against live Meet on 2026-10-02 (spike jitsi2outline-8kp, runs
-// 4-5, Workspace-hosted and externally hosted meetings).
+// Last checked in live Meet tests on 2026-10-02 (Workspace-hosted and
+// externally hosted meetings).
 
 /** Injected before any Meet script: every captured mic/camera track starts
  * disabled and stays so — Meet setting track.enabled = true hits a no-op.
@@ -277,8 +277,9 @@ function captionsOn(mayClick) {
     document.querySelector('button[aria-label*="Turn on captions" i]') ||
     [...document.querySelectorAll('button')].find((x) => /closed_caption_off/.test(x.innerText || ''));
   if (!b || !mayClick) return { on: false, did: null };
+  const label = (b.getAttribute('aria-label') || b.innerText || '').trim(); // before the click flips it
   b.click();
-  return { on: false, did: `clicked "${(b.getAttribute('aria-label') || b.innerText || '').trim()}"` };
+  return { on: false, did: `clicked "${label}"` };
 }
 
 /** The caption blocks (one per speaker turn) in the captions region:
@@ -410,7 +411,7 @@ function launchOpts(dir, server) {
       '--use-fake-device-for-media-stream',
       `--use-file-for-fake-audio-capture=${audio}`,
       `--use-file-for-fake-video-capture=${video}`,
-      // The usual evasions open-source Meet bots ship with; the spike passed
+      // The usual evasions open-source Meet bots ship with; live Meet tests passed
       // Meet's bot check with these and no stealth plugin.
       '--disable-blink-features=AutomationControlled',
     ],
@@ -560,7 +561,7 @@ async function main(argv) {
       if (/HeadlessChrome/.test(ua)) await page.setUserAgent(ua.replace('HeadlessChrome', 'Chrome'));
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
       await page.evaluateOnNewDocument(lockMedia);
-      // Meet may not play call audio to a guest without devices (spike runs 1-3).
+      // Meet may not play call audio to a guest without devices (seen in live Meet tests).
       await browser.defaultBrowserContext().overridePermissions('https://meet.google.com', ['camera', 'microphone']);
       log(`joining room ${meetingCode(opts.url)} as ${opts.displayName}`);
       page.on('close', () => (pageGone = true));
