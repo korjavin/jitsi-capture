@@ -1,4 +1,7 @@
-# Google Meet join spike (throwaway — do not merge into record.js)
+# Google Meet join spike (throwaway — do not fold into record.js)
+
+The deployed bot runs this script on a `meet-spike <url> [seconds=N]` DM (guest
+mode, see the main README), so no local setup is needed for the guest runs.
 
 Bead `jitsi2outline-8kp`. `meet-spike.js` tries to join a real Google Meet call
 with Puppeteer Chromium and logs what the go/no-go report needs:

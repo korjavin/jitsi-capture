@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -183,10 +185,49 @@ func (z *Zulip) do(ctx context.Context, method, path string, query, form url.Val
 	if err != nil {
 		return err
 	}
-	req.SetBasicAuth(z.email, z.key)
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
+	return z.send(req, out)
+}
+
+// Upload stores a file on the Zulip server and returns its /user_uploads/...
+// path, which renders as a link in a message.
+func (z *Zulip) Upload(ctx context.Context, name string, r io.Reader) (string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", name)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(fw, r); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, z.site+"/api/v1/user_uploads", &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	var res struct {
+		URL string `json:"url"`
+		URI string `json:"uri"` // pre-9.0 servers only send this one
+	}
+	if err := z.send(req, &res); err != nil {
+		return "", err
+	}
+	if res.URL == "" {
+		res.URL = res.URI
+	}
+	return res.URL, nil
+}
+
+// send authenticates req, runs it and decodes the body into out.
+func (z *Zulip) send(req *http.Request, out any) error {
+	method, path := req.Method, req.URL.Path
+	req.SetBasicAuth(z.email, z.key)
 	resp, err := z.http.Do(req)
 	if err != nil {
 		return err

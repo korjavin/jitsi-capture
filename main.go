@@ -132,7 +132,9 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		}
 	}()
 
-	runErr := newBot(cfg, z, runner.Start).Run(ctx)
+	bot := newBot(cfg, z, runner.Start)
+	bot.spike = newSpike(ctx, bg, cfg, z).Handle
+	runErr := bot.Run(ctx)
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()

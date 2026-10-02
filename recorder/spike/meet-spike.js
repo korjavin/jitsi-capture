@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// THROWAWAY SPIKE (bead jitsi2outline-8kp) — do not merge into record.js.
+// THROWAWAY SPIKE (bead jitsi2outline-8kp) — do not fold into record.js. The Go
+// service runs it on a "meet-spike" DM (spike.go).
 // Tries to join a Google Meet call with Puppeteer Chromium and logs everything
 // the go/no-go report needs: page state transitions with the text that drove
 // them, every incoming WebRTC audio track, per-SSRC audio levels, visible
