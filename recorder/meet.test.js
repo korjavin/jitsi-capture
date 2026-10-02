@@ -89,10 +89,11 @@ test('readState classifies the Meet screens', () => {
 });
 
 test('otherNames drops the bot and treats no tiles as unknown', () => {
-  assert.deepStrictEqual(otherNames({ tiles: 3, names: ['Alice', 'NoteTaker', 'Bob (You)', 'Carol'], self: [] }, 'NoteTaker'), ['Alice', 'Carol']);
-  assert.deepStrictEqual(otherNames({ tiles: 1, names: ['Meet Bot'], self: ['Meet Bot'] }, 'NoteTaker'), []);
+  assert.deepStrictEqual(otherNames({ tiles: 3, unnamed: 0, names: ['Alice', 'NoteTaker', 'Bob (You)', 'Carol'], self: [] }, 'NoteTaker'), ['Alice', 'Carol']);
+  assert.deepStrictEqual(otherNames({ tiles: 1, unnamed: 0, names: ['Meet Bot'], self: ['Meet Bot'] }, 'NoteTaker'), []);
   assert.strictEqual(otherNames({ tiles: 0, names: [], self: [] }, 'NoteTaker'), null);
-  assert.strictEqual(otherNames({ tiles: 2, names: [], self: [] }, 'NoteTaker'), null, 'tiles without name text');
+  assert.strictEqual(otherNames({ tiles: 2, unnamed: 2, names: [], self: [] }, 'NoteTaker'), null, 'tiles without name text');
+  assert.strictEqual(otherNames({ tiles: 2, unnamed: 1, names: ['NoteTaker'], self: [] }, 'NoteTaker'), null, 'one nameless tile');
 });
 
 test('meetShouldStop: empty grace on a readable empty roster, never on an unknown one', () => {
@@ -215,6 +216,8 @@ function canRunBrowser() {
   }
 }
 
+let fakePage = null; // the page main() drives, for tests that break it
+
 /** Serve FAKE_MEET for meet.google.com on every page main() opens. */
 function fakeMeet() {
   const puppeteer = require('puppeteer');
@@ -222,6 +225,7 @@ function fakeMeet() {
   puppeteer.launch = async (o) => {
     const browser = await launch(o);
     const [page] = await browser.pages();
+    fakePage = page;
     await page.setRequestInterception(true);
     page.on('request', (r) =>
       r.url().startsWith('https://meet.google.com/') ? r.respond({ contentType: 'text/html', body: FAKE_MEET }) : r.abort(),
@@ -298,6 +302,26 @@ test('end to end: stops on its own once the room is empty', { skip, timeout: 120
     const res = JSON.parse(stdout);
     assert.strictEqual(res.reason, 'empty_room');
     assert.deepStrictEqual(res.participants, ['Alice']);
+  } finally {
+    restore();
+    process.removeAllListeners('SIGTERM');
+    process.removeAllListeners('SIGINT');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('end to end: the Meet page dying mid-call is a truncated recording (exit 5)', { skip, timeout: 120000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-e2e-'));
+  const restore = fakeMeet();
+  try {
+    const out = path.join(dir, 'audio.wav');
+    const { code, stdout } = await runMain(['--url', URL, '--out', out, '--join-timeout', '60'], async () => {
+      for (let i = 0; i < 300 && !fs.existsSync(out); i++) await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 2000));
+      await fakePage.close();
+    });
+    assert.strictEqual(code, 5);
+    assert.strictEqual(stdout, '');
   } finally {
     restore();
     process.removeAllListeners('SIGTERM');

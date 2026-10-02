@@ -187,6 +187,7 @@ function readNames() {
   const panel = [...document.querySelectorAll('[role="list"][aria-label*="articipant" i] [role="listitem"]')];
   return {
     tiles: tileEls.length,
+    unnamed: tileEls.filter((e) => !firstLine(e)).length,
     names: uniq([...tileEls.map(firstLine), ...panel.map((e) => e.getAttribute('aria-label') || firstLine(e))]),
     self: uniq([...document.querySelectorAll('[data-self-name]')].map((e) => e.getAttribute('data-self-name'))),
   };
@@ -195,9 +196,12 @@ function readNames() {
 // --- node side ----------------------------------------------------------------
 
 /** Names other than the bot's, or null when the roster is unreadable — no
- * tile on screen, or tiles without any name text (the bot's own included). */
-function otherNames({ tiles, names, self }, displayName) {
-  if (!tiles || !names.length) return null;
+ * tile on screen, or any tile without name text: a missing name must never
+ * make the room look empty. */
+function otherNames({ tiles, unnamed, names, self }, displayName) {
+  // ponytail: one nameless tile (a placeholder, a share) disables the empty-room
+  // rule for that poll; --max-duration is the backstop.
+  if (!tiles || unnamed || !names.length) return null;
   const me = new Set([displayName, ...self].map((s) => s.toLowerCase()));
   return names.filter((n) => !me.has(n.toLowerCase()) && !/\(you\)$/i.test(n) && !/^you$/i.test(n));
 }
@@ -384,6 +388,7 @@ async function main(argv) {
   let pulse = null;
   let parec = null;
   let browser = null;
+  let pageGone = false;
   try {
     let page;
     try {
@@ -397,6 +402,8 @@ async function main(argv) {
       // Meet may not play call audio to a guest without devices (spike runs 1-3).
       await browser.defaultBrowserContext().overridePermissions('https://meet.google.com', ['camera', 'microphone']);
       log(`joining room ${meetingCode(opts.url)} as ${opts.displayName}`);
+      page.on('close', () => (pageGone = true));
+      page.on('error', () => (pageGone = true)); // the renderer crashed
       await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch (e) {
       log(`browser launch/page failure: ${scrub(e.message)}`);
@@ -473,7 +480,7 @@ async function main(argv) {
       await sleep(POLL_MS);
       if (!alive(parec)) failure = `audio capture (parec) exited mid-call: ${parec.err.trim().split('\n').pop() || 'no error'}`;
       else if (!alive(pulse.proc)) failure = 'pulseaudio exited mid-call';
-      else if (!browser.connected) failure = 'browser died mid-call';
+      else if (!browser.connected || pageGone) failure = 'the Meet page closed or crashed mid-call';
       if (failure) break;
       const s = await page.evaluate(readState).catch(() => ({ state: 'probe-error' }));
       if (s.state === 'ended' || s.state === 'removed') {

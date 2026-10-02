@@ -256,7 +256,8 @@ node meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <path/audio.wav>
   counts the participant names visible on the video tiles (and the people
   panel when open), bot excluded; when no tile or no name can be read the roster
   counts as unknown, never as empty, so a Meet markup change cannot cut a call
-  short — it falls back to `--max-duration` instead.
+  short — it falls back to `--max-duration` instead. The Meet page closing or
+  crashing mid-call, or `parec`/PulseAudio exiting, is exit 5 (truncated).
 
 How the audio is captured — the only method the Meet spike found working:
 Meet plays call audio only to a participant that has media devices. Chromium
@@ -296,7 +297,7 @@ against a fake Meet page served by request interception (no network): the page
 plays a tone over a WebRTC track the way Meet does, refuses the bot if it
 knocks with the mic or camera on or a captured track can be re-enabled, and the
 tests check the WAV level, header and stdout line after `SIGTERM` and after an
-empty room. They skip without Chromium/pulseaudio (the CI node job) and run in
+empty room, and exit 5 when the page dies mid-call. They skip without Chromium/pulseaudio (the CI node job) and run in
 the Docker image, which CI does:
 
 ```bash
