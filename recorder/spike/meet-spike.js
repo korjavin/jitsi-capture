@@ -485,9 +485,9 @@ async function pollMedia() {
   );
   // Meet's own <audio> elements vs ours: is anything actually playing?
   const els = (a) => ({ n: a.length, playing: a.filter((e) => !e.paused).length, muted: a.filter((e) => e.muted).length });
-  const recRms = Number(S.peaks.mix.toFixed(4));
-  const tabRms = Number(S.peaks.tab.toFixed(4));
-  const tapRms = Number(S.tapPeak.toFixed(4));
+  const recRms = Number(S.peaks.mix.toPrecision(3)); // toPrecision: -93 dB must not round to silence
+  const tabRms = Number(S.peaks.tab.toPrecision(3));
+  const tapRms = Number(S.tapPeak.toPrecision(3));
   // Audio output devices the page sees (0 = Meet's "Speaker not found").
   const outs = await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').length, () => null);
   S.peaks.mix = S.peaks.tab = S.tapPeak = 0;
