@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -65,7 +66,7 @@ type Spike struct {
 	name    string
 	dataDir string
 	busy    atomic.Bool
-	done    func() // test hook, called when a run has replied
+	wg      sync.WaitGroup // every goroutine Handle starts
 }
 
 func newSpike(ctx, bg context.Context, cfg Config, z spikeZulip) *Spike {
@@ -80,21 +81,43 @@ func (s *Spike) Handle(m Message) {
 	to := Job{DMUserID: m.SenderID}
 	url, seconds, ok := parseSpike(m.Content)
 	if !ok {
-		go s.reply(to, "usage: `meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N]` (default 90, max 600)")
+		s.async(func() {
+			s.reply(to, "usage: `meet-spike https://meet.google.com/xxx-yyyy-zzz [seconds=N]` (default 90, max 600)")
+		})
 		return
 	}
 	if !s.busy.CompareAndSwap(false, true) {
-		go s.reply(to, "busy: a meet-spike run is already in progress")
+		s.async(func() { s.reply(to, "busy: a meet-spike run is already in progress") })
 		return
 	}
-	go func() {
+	s.async(func() {
 		defer s.busy.Store(false)
-		if s.done != nil {
-			defer s.done()
-		}
 		s.reply(to, fmt.Sprintf("meet-spike: joining as guest for %d s, admit me from the lobby (I wait up to %d s).", seconds, spikeJoinTimeoutS))
 		s.reply(to, s.run(url, seconds))
+	})
+}
+
+func (s *Spike) async(f func()) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		f()
 	}()
+}
+
+// Wait gives the goroutines Handle started — a run that shutdown interrupted
+// included — up to d to stop the child, upload the audio and reply.
+func (s *Spike) Wait(d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		slog.Warn("meet-spike still running at shutdown")
+	}
 }
 
 func (s *Spike) reply(to Job, text string) {

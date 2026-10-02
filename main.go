@@ -133,7 +133,8 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	}()
 
 	bot := newBot(cfg, z, runner.Start)
-	bot.spike = newSpike(ctx, bg, cfg, z).Handle
+	spike := newSpike(ctx, bg, cfg, z)
+	bot.spike = spike.Handle
 	runErr := bot.Run(ctx)
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
@@ -142,6 +143,9 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 		slog.Warn("http shutdown", "err", err)
 	}
 	runner.Stop(recorderGrace)
+	// ponytail: after the recorders' grace, not alongside it; the spike child got
+	// its SIGINT with ctx, so it has usually finished by now.
+	spike.Wait(recorderGrace)
 	return runErr
 }
 

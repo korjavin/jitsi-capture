@@ -120,7 +120,10 @@ function installHooks() {
 /** Classify the current page. Order matters: terminal states win over "the
  * Leave button is still in the DOM". */
 function readState() {
-  const text = (document.body && document.body.innerText) || '';
+  // Captions are participant speech: "the call has ended" said aloud must not end the run.
+  const cap = document.querySelector('[role="region"][aria-label*="aption" i]');
+  let text = (document.body && document.body.innerText) || '';
+  if (cap && cap.innerText) text = text.replace(cap.innerText, '');
   const flat = text.replace(/\s+/g, ' ').trim();
   const has = (re) => {
     const m = flat.match(re);
@@ -174,7 +177,8 @@ function prejoinActions(name) {
 
 function clickJoin() {
   const b = [...document.querySelectorAll('button, [role="button"]')].find((x) =>
-    /^(ask to join( anyway)?|join( the call)? now|join anyway|join here too)$/i.test((x.innerText || '').trim()),
+    /^(ask to join( anyway)?|join( the call)? now|join anyway|join here too)$/i.test((x.innerText || '').trim()) &&
+    !x.disabled && x.getAttribute('aria-disabled') !== 'true', // a disabled click is a no-op: retry next poll
   );
   if (b) b.click();
   return b ? b.innerText.trim() : null;

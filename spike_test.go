@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSpike(t *testing.T) {
@@ -35,7 +36,7 @@ func TestParseSpike(t *testing.T) {
 }
 
 // spikeFixture runs Spike against an httptest Zulip that accepts uploads.
-func spikeFixture(t *testing.T) (*Spike, *zulipServer, chan struct{}) {
+func spikeFixture(t *testing.T) (*Spike, *zulipServer) {
 	t.Helper()
 	z, srv := newZulipServer(t, func(w http.ResponseWriter, r *http.Request, _ url.Values) {
 		if r.URL.Path == "/api/v1/user_uploads" {
@@ -47,9 +48,7 @@ func spikeFixture(t *testing.T) (*Spike, *zulipServer, chan struct{}) {
 	s := newSpike(context.Background(), context.Background(),
 		Config{DataDir: t.TempDir(), RecorderPath: "unused", BotDisplayName: "NoteTaker"}, z)
 	s.script = filepath.Join("testdata", "meet_spike.sh")
-	done := make(chan struct{}, 2)
-	s.done = func() { done <- struct{}{} }
-	return s, srv, done
+	return s, srv
 }
 
 func dmReplies(srv *zulipServer) []string {
@@ -63,9 +62,9 @@ func dmReplies(srv *zulipServer) []string {
 }
 
 func TestSpikeRunsAndReportsBack(t *testing.T) {
-	s, srv, done := spikeFixture(t)
+	s, srv := spikeFixture(t)
 	s.Handle(Message{ID: 1, Type: "private", SenderID: 42, Content: "meet-spike https://meet.google.com/abc-defg-hij seconds=30"})
-	<-done
+	s.Wait(15 * time.Second)
 
 	replies := dmReplies(srv)
 	if len(replies) != 2 || !strings.Contains(replies[0], "admit me from the lobby") {
@@ -102,19 +101,24 @@ func TestSpikeRunsAndReportsBack(t *testing.T) {
 
 func TestSpikeOneRunAtATime(t *testing.T) {
 	t.Setenv("FAKE_SPIKE_SLEEP", "1")
-	s, srv, done := spikeFixture(t)
+	s, srv := spikeFixture(t)
 	m := Message{ID: 1, Type: "private", SenderID: 42, Content: "meet-spike https://meet.google.com/abc-defg-hij"}
 	s.Handle(m)
 	s.Handle(m)
-	<-done
-	eventually(t, "the busy reply", func() bool {
-		for _, r := range dmReplies(srv) {
-			if strings.HasPrefix(r, "busy") {
-				return true
-			}
+	s.Handle(Message{ID: 2, Type: "private", SenderID: 42, Content: "meet-spike please"})
+	s.Wait(15 * time.Second)
+	var busy, usage int
+	for _, r := range dmReplies(srv) {
+		if strings.HasPrefix(r, "busy") {
+			busy++
 		}
-		return false
-	})
+		if strings.HasPrefix(r, "usage") {
+			usage++
+		}
+	}
+	if busy != 1 || usage != 1 {
+		t.Errorf("busy/usage replies = %d/%d; want 1/1: %q", busy, usage, dmReplies(srv))
+	}
 }
 
 func TestBotRoutesSpikeDMs(t *testing.T) {
