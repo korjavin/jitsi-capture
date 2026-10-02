@@ -36,6 +36,7 @@ test('parseArgs takes --captions-out anywhere among the pairs', () => {
   assert.strictEqual(o.captionsOut, '/tmp/c.jsonl');
   assert.strictEqual(o.joinTimeout, 30);
   assert.throws(() => parseArgs([...MIN, '--captions-out']), /missing value/);
+  assert.throws(() => parseArgs([...MIN, '--captions-out', '/tmp/../tmp/a.wav']), /differ from --out/);
 });
 
 test('foldCaptions stores each utterance once, with its final text', () => {

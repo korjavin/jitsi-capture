@@ -66,7 +66,10 @@ function parseArgs(argv) {
   if (at >= 0 && !captionsOut) throw new Error('missing value for --captions-out');
   if (at >= 0) argv = [...argv.slice(0, at), ...argv.slice(at + 2)];
   const opts = parseRecordArgs(argv);
-  if (captionsOut) opts.captionsOut = captionsOut;
+  if (captionsOut) {
+    opts.captionsOut = path.resolve(captionsOut);
+    if (opts.captionsOut === path.resolve(opts.out)) throw new Error('--captions-out must differ from --out');
+  }
   if (!argv.some((a, i) => i % 2 === 0 && a === '--join-timeout')) opts.joinTimeout = JOIN_TIMEOUT_S;
   if (!/^https:\/\/meet\.google\.com\/./.test(opts.url)) throw new Error('--url must be a https://meet.google.com/... URL');
   return opts;
@@ -301,7 +304,9 @@ function readCaptions() {
     const cand = [...region.querySelectorAll('*')].filter((e) => {
       if (e.children.length < 2) return false;
       const name = (e.children[0].innerText || '').trim();
-      return name && name.length <= 80 && !name.includes('\n') && txt(e).length > name.length;
+      // A turn seen before (it has an id) stays a candidate once cleared, so
+      // foldCaptions sees the empty text and lets Meet reuse the element.
+      return name && name.length <= 80 && !name.includes('\n') && (txt(e).length > name.length || e.dataset.capId);
     });
     // A wrapper with two or more candidate children is the caption list, not a
     // turn; of the rest the outermost wins (a text div of several spans can
@@ -519,9 +524,13 @@ async function main(argv) {
   fs.mkdirSync(path.dirname(opts.out), { recursive: true });
   fs.rmSync(opts.out, { force: true }); // truncate semantics, like record.js
   if (opts.captionsOut) {
-    opts.captionsOut = path.resolve(opts.captionsOut);
-    fs.mkdirSync(path.dirname(opts.captionsOut), { recursive: true });
-    fs.rmSync(opts.captionsOut, { force: true });
+    try {
+      fs.mkdirSync(path.dirname(opts.captionsOut), { recursive: true });
+      fs.rmSync(opts.captionsOut, { force: true });
+    } catch (e) {
+      log(`captions: cannot prepare the output (${e.message}); recording without speaker hints`);
+      delete opts.captionsOut;
+    }
   }
 
   let reason = null;
