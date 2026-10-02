@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 
 // Requiring must not launch a browser.
-const { parseArgs, foldCaptions, readState, wavLevel, CAPTION_SETTLE_MS } = require('./meet-spike.js');
+const { parseArgs, foldCaptions, readState, wavLevel, silentWav, speechFrac, launchOpts, micCam, CAPTION_SETTLE_MS } = require('./meet-spike.js');
 
 const URL = 'https://meet.google.com/abc-defg-hij';
 
@@ -87,9 +87,42 @@ test('wavLevel: silence is null, a constant half-scale signal is -6 dBFS, the lo
     samples.forEach((v, i) => d.writeInt16LE(Math.round(v * 32767), i * 2));
     return Buffer.concat([h, d]);
   };
-  assert.deepStrictEqual(wavLevel(wav(new Array(16000).fill(0))), { s: 1, rmsDb: null, peakDb: null });
+  assert.deepStrictEqual(wavLevel(wav(new Array(16000).fill(0))), { s: 1, rmsDb: null, peakDb: null, speech: 0 });
   const l = wavLevel(wav([...new Array(16000).fill(0), ...new Array(3200).fill(0.5)]));
   assert.strictEqual(l.peakDb, -6);
   assert.ok(l.rmsDb < -13 && l.rmsDb > -15, `rmsDb ${l.rmsDb}`);
   assert.strictEqual(wavLevel(Buffer.from('not a wav')), null);
+  // speech: whole seconds above -45 dBFS. 1 s at -40 dB, 1 s at -50 dB, 1 s silent, 1 s at -6 dB.
+  const lvl = (dB) => new Array(16000).fill(10 ** (dB / 20)).map((v, i) => (i % 2 ? v : -v)); // square wave: RMS = amplitude
+  const s = wavLevel(wav([...lvl(-40), ...lvl(-50), ...new Array(16000).fill(0), ...lvl(-6)]));
+  assert.strictEqual(s.speech, 0.5);
+});
+
+test('silentWav is a valid WAV of digital silence (the fake mic must send nothing)', () => {
+  assert.deepStrictEqual(wavLevel(silentWav(2)), { s: 2, rmsDb: null, peakDb: null, speech: 0 });
+  assert.strictEqual(speechFrac([3, 4]), 0.75);
+  assert.strictEqual(speechFrac(null), null);
+});
+
+test('launchOpts: fake devices come from the given files, only when asked', () => {
+  const args = launchOpts({ plain: true, fakeMedia: { audio: '/x/s.wav', video: '/x/b.y4m' } }).args;
+  for (const a of ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--use-file-for-fake-audio-capture=/x/s.wav', '--use-file-for-fake-video-capture=/x/b.y4m'])
+    assert.ok(args.includes(a), a);
+  assert.ok(!launchOpts({ plain: true }).args.some((a) => a.includes('fake')));
+});
+
+test('micCam: reads Meet toggles and clicks only the "Turn off" ones', () => {
+  const clicked = [];
+  const btn = (label) => ({ getAttribute: () => label, click: () => clicked.push(label) });
+  global.document = { querySelectorAll: () => [btn('Turn off microphone (ctrl + d)'), btn('Turn on camera (ctrl + e)'), btn('Leave call')] };
+  try {
+    assert.deepStrictEqual(micCam(false), { mic: 'on', cam: 'off', did: [] });
+    assert.deepStrictEqual(clicked, []);
+    assert.strictEqual(micCam(true).mic, 'on', 'state is from before the click');
+    assert.deepStrictEqual(clicked, ['Turn off microphone (ctrl + d)']);
+    global.document = { querySelectorAll: () => [btn('Leave call')] };
+    assert.deepStrictEqual(micCam(true), { mic: '?', cam: '?', did: [] });
+  } finally {
+    delete global.document;
+  }
 });

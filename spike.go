@@ -190,7 +190,8 @@ func (s *Spike) run(url string, seconds int, lang string) (report, captions stri
 	fmt.Fprintf(&b, "meet-spike finished, exit code %d (0 recorded, 2 bad args, 3 never admitted, 4 error, -1 timeout/shutdown)\n```text\n%s\n```\n", code, spikeLines(stderr.String()))
 	b.WriteString(s.upload("Audio", filepath.Join(outDir, "mixed.webm"), "meet-spike.webm") + "\n")
 	b.WriteString(s.upload("Monitor audio", filepath.Join(outDir, "monitor.wav"), "meet-spike-monitor.wav") + "\n")
-	b.WriteString(s.upload("Tab audio", filepath.Join(outDir, "tab.webm"), "meet-spike-tab.webm"))
+	b.WriteString(s.upload("Tab audio", filepath.Join(outDir, "tab.webm"), "meet-spike-tab.webm") + "\n")
+	b.WriteString(s.upload("Log", filepath.Join(outDir, "spike.log"), "meet-spike.log"))
 	return b.String(), s.captionsReport(filepath.Join(outDir, "captions.jsonl"))
 }
 
@@ -250,10 +251,13 @@ func (s *Spike) captionsReport(path string) string {
 }
 
 // spikeLines keeps the lines of the script's log the go/no-go report needs:
-// the last 8 STATE lines, the last 2 media and names samples, pulse, AUDIO (the level per capture method) and SUMMARY (whose result field carries a fatal error).
+// the last 6 STATE lines, the last media, names, rtp and captions-text samples,
+// the devices lines (prejoin and in-call, last 2), pulse, AUDIO (the level per
+// capture method) and SUMMARY (whose result field carries a fatal error) — at
+// most 15 lines. The whole log is uploaded as well.
 // Anything else (an argument error, a crash) falls back to the log's tail.
 func spikeLines(log string) string {
-	var states, media, names, rest, all []string
+	var states, media, names, devices, rtp, capText, rest, all []string
 	for _, l := range strings.Split(strings.TrimSpace(log), "\n") {
 		if len(l) > spikeLineMax {
 			l = strings.ToValidUTF8(l[:spikeLineMax], "") + "…"
@@ -266,12 +270,21 @@ func spikeLines(log string) string {
 			media = append(media, l)
 		case strings.Contains(l, "] names "):
 			names = append(names, l)
+		case strings.Contains(l, "] devices "):
+			devices = append(devices, l)
+		case strings.Contains(l, "] rtp {"):
+			rtp = append(rtp, l)
+		case strings.Contains(l, "] captions text "):
+			capText = append(capText, l)
 		case strings.Contains(l, "] SUMMARY"), strings.Contains(l, "] AUDIO"), strings.Contains(l, "] pulse: "):
 			rest = append(rest, l)
 		}
 	}
 	tail := func(a []string, n int) []string { return a[max(0, len(a)-n):] }
-	out := append(append(append(tail(states, 8), tail(media, 2)...), tail(names, 2)...), rest...)
+	var out []string
+	for _, part := range [][]string{tail(states, 6), tail(devices, 2), tail(media, 1), tail(rtp, 1), tail(names, 1), tail(capText, 1), rest} {
+		out = append(out, part...)
+	}
 	if len(out) == 0 {
 		out = tail(all, 8)
 	}
