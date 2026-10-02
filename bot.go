@@ -23,6 +23,7 @@ type Bot struct {
 	botID   int64
 	jitsiRe *regexp.Regexp
 	start   func(Job) error // the runner's Start; a plain func value is the seam
+	spike   func(Message)   // a "meet-spike ..." DM; nil disables the command
 }
 
 func newBot(cfg Config, z *Zulip, start func(Job) error) *Bot {
@@ -100,7 +101,14 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 	switch {
 	case ev.Type == "message" && ev.Message != nil:
 		m := ev.Message
-		if m.SenderID == b.botID || !b.jitsiRe.MatchString(m.Content) {
+		if m.SenderID == b.botID {
+			return
+		}
+		if m.Type == "private" && b.spike != nil && strings.HasPrefix(strings.TrimSpace(m.Content), spikeCommand) {
+			b.spike(*m)
+			return
+		}
+		if !b.jitsiRe.MatchString(m.Content) {
 			return
 		}
 		if m.Type == "private" {
