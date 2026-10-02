@@ -18,19 +18,23 @@ func TestParseSpike(t *testing.T) {
 		in   string
 		url  string
 		secs int
+		lang string
 		ok   bool
 	}{
-		{"meet-spike https://meet.google.com/abc-defg-hij", "https://meet.google.com/abc-defg-hij", 90, true},
-		{"  meet-spike <https://meet.google.com/abc-defg-hij> seconds=30 ", "https://meet.google.com/abc-defg-hij", 30, true},
-		{"meet-spike https://meet.google.com/abc-defg-hij seconds=9999", "https://meet.google.com/abc-defg-hij", 600, true},
-		{"meet-spike https://meet.google.com/abc-defg-hij seconds=0", "", 0, false},
-		{"meet-spike https://meet.google.com/abc-defg-hij?authuser=1", "", 0, false},
-		{"meet-spike https://evil.example/abc", "", 0, false},
-		{"meet-spike", "", 0, false},
+		{"meet-spike https://meet.google.com/abc-defg-hij", "https://meet.google.com/abc-defg-hij", 90, "", true},
+		{"  meet-spike <https://meet.google.com/abc-defg-hij> seconds=30 ", "https://meet.google.com/abc-defg-hij", 30, "", true},
+		{"meet-spike https://meet.google.com/abc-defg-hij seconds=9999", "https://meet.google.com/abc-defg-hij", 600, "", true},
+		{"meet-spike https://meet.google.com/abc-defg-hij lang=de-DE seconds=60", "https://meet.google.com/abc-defg-hij", 60, "de-DE", true},
+		{`meet-spike https://meet.google.com/abc-defg-hij lang=en"]`, "", 0, "", false},
+		{"meet-spike https://meet.google.com/abc-defg-hij color=red", "", 0, "", false},
+		{"meet-spike https://meet.google.com/abc-defg-hij seconds=0", "", 0, "", false},
+		{"meet-spike https://meet.google.com/abc-defg-hij?authuser=1", "", 0, "", false},
+		{"meet-spike https://evil.example/abc", "", 0, "", false},
+		{"meet-spike", "", 0, "", false},
 	} {
-		u, s, ok := parseSpike(tc.in)
-		if u != tc.url || s != tc.secs || ok != tc.ok {
-			t.Errorf("parseSpike(%q) = %q, %d, %v; want %q, %d, %v", tc.in, u, s, ok, tc.url, tc.secs, tc.ok)
+		u, s, l, ok := parseSpike(tc.in)
+		if u != tc.url || s != tc.secs || l != tc.lang || ok != tc.ok {
+			t.Errorf("parseSpike(%q) = %q, %d, %q, %v; want %q, %d, %q, %v", tc.in, u, s, l, ok, tc.url, tc.secs, tc.lang, tc.ok)
 		}
 	}
 }
@@ -63,12 +67,15 @@ func dmReplies(srv *zulipServer) []string {
 
 func TestSpikeRunsAndReportsBack(t *testing.T) {
 	s, srv := spikeFixture(t)
-	s.Handle(Message{ID: 1, Type: "private", SenderID: 42, Content: "meet-spike https://meet.google.com/abc-defg-hij seconds=30"})
+	s.Handle(Message{ID: 1, Type: "private", SenderID: 42, Content: "meet-spike https://meet.google.com/abc-defg-hij seconds=30 lang=en-US"})
 	s.Wait(15 * time.Second)
 
 	replies := dmReplies(srv)
-	if len(replies) != 2 || !strings.Contains(replies[0], "admit me from the lobby") {
-		t.Fatalf("replies = %q; want the lobby notice then the report", replies)
+	if len(replies) != 3 || !strings.Contains(replies[0], "admit me from the lobby") {
+		t.Fatalf("replies = %q; want the lobby notice, the report, the captions", replies)
+	}
+	if want := "Captions: 2 lines, the first 2:\n```text\nAlice: Hello everyone.\nBob: Hi there\n```\nCaptions: [captions.jsonl]("; !strings.Contains(replies[2], want) {
+		t.Errorf("captions reply = %q; want %q", replies[2], want)
 	}
 	for _, r := range srv.requests() {
 		if r.path == "/api/v1/messages" && r.form.Get("to") != "[42]" {
@@ -93,7 +100,7 @@ func TestSpikeRunsAndReportsBack(t *testing.T) {
 		t.Fatalf("args files = %v; want one run under DATA_DIR/spike", dirs)
 	}
 	args, _ := os.ReadFile(dirs[0])
-	want := "https://meet.google.com/abc-defg-hij --seconds 30 --join-timeout 300 --captions --name NoteTaker --out-dir " + filepath.Dir(dirs[0])
+	want := "https://meet.google.com/abc-defg-hij --seconds 30 --join-timeout 300 --captions --name NoteTaker --out-dir " + filepath.Dir(dirs[0]) + " --lang en-US"
 	if strings.TrimSpace(string(args)) != want {
 		t.Errorf("script args = %q; want %q", args, want)
 	}

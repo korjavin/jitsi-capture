@@ -18,12 +18,15 @@ const path = require('node:path');
 const USAGE = `usage: meet-spike.js <meet-url> [--user-data-dir <dir>] [--headful]
                     [--seconds <record sec, default 120>] [--join-timeout <sec, default 300>]
                     [--name <guest name, default NoteTaker>] [--out-dir <dir, default ./meet-spike-out>]
-                    [--captions] [--plain]
+                    [--captions [--lang <code>]] [--plain]
        meet-spike.js --login --user-data-dir <dir>     (headful; sign the bot account in, then close the window)
 
   --plain   disable the anti-automation tweaks (UA fix, AutomationControlled,
             --enable-automation) to see whether Meet blocks a stock Puppeteer.
-  --captions  turn Meet captions on after admission and log caption text.`;
+  --captions  turn Meet captions on after admission and save caption lines
+            (speaker, text, time) to captions.jsonl in the out dir.
+  --lang    with --captions: pick this caption (spoken) language in Meet's
+            settings, e.g. en-US or de-DE. Best effort; default leaves Meet's.`;
 
 function parseArgs(argv) {
   const o = {
@@ -37,8 +40,9 @@ function parseArgs(argv) {
     joinTimeout: 300,
     name: 'NoteTaker',
     outDir: 'meet-spike-out',
+    lang: '',
   };
-  const val = { '--user-data-dir': 'userDataDir', '--name': 'name', '--out-dir': 'outDir' };
+  const val = { '--user-data-dir': 'userDataDir', '--name': 'name', '--out-dir': 'outDir', '--lang': 'lang' };
   const num = { '--seconds': 'seconds', '--join-timeout': 'joinTimeout' };
   const bool = { '--headful': 'headful', '--login': 'login', '--plain': 'plain', '--captions': 'captions' };
   for (let i = 0; i < argv.length; i++) {
@@ -55,6 +59,8 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument ${a}`);
   }
   if (o.login && !o.userDataDir) throw new Error('--login needs --user-data-dir');
+  // It ends up inside a CSS selector: letters, digits and dashes only.
+  if (o.lang && !/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(o.lang)) throw new Error('--lang must be a language code like en-US');
   if (!o.login && !/^https:\/\/meet\.google\.com\//.test(o.url)) throw new Error('need a https://meet.google.com/... URL');
   return o;
 }
@@ -68,15 +74,81 @@ function log(msg, data) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const CAPTION_SETTLE_MS = 3000;
+
+/**
+ * Fold one captions poll into finished utterances. Meet rewrites the newest
+ * block while its speaker talks (and corrects older ones for a moment), so a
+ * block is final once it left the DOM, or a newer block exists and it has not
+ * changed for CAPTION_SETTLE_MS, or the run ends (`flush`). A block whose text
+ * shrinks to under half is Meet restarting a long turn in the same element: the
+ * old text is final. Returns [{ts, speaker, text}] to append, each one once.
+ * `st` = { open: Map(id -> utterance), done: Set(id) }.
+ * ponytail: corrections Meet makes after a block is final are dropped.
+ */
+function foldCaptions(st, blocks, now, flush = false) {
+  const out = [];
+  const final = (id) => {
+    const u = st.open.get(id);
+    st.open.delete(id);
+    st.done.add(id);
+    out.push({ ts: new Date(u.first).toISOString(), speaker: u.speaker, text: u.text });
+  };
+  const present = new Set();
+  for (const b of blocks) {
+    if (!b.text) {
+      // Still on screen but cleared: its turn is over and Meet may reuse the
+      // element for the next one, so its id may start a new utterance.
+      present.add(b.id);
+      if (st.open.has(b.id)) final(b.id);
+      st.done.delete(b.id);
+      continue;
+    }
+    if (st.done.has(b.id)) continue;
+    present.add(b.id);
+    const u = st.open.get(b.id);
+    if (!u) st.open.set(b.id, { speaker: b.name || '?', text: b.text, first: now, changed: now });
+    else if (b.text !== u.text) {
+      if (b.text.length < u.text.length / 2) {
+        out.push({ ts: new Date(u.first).toISOString(), speaker: u.speaker, text: u.text });
+        Object.assign(u, { first: now });
+      }
+      Object.assign(u, { speaker: b.name || u.speaker, text: b.text, changed: now });
+    }
+  }
+  const withText = blocks.filter((b) => b.text);
+  const newest = withText.length ? withText[withText.length - 1].id : null;
+  for (const [id, u] of [...st.open]) {
+    if (flush || !present.has(id) || (id !== newest && now - u.changed >= CAPTION_SETTLE_MS)) final(id);
+  }
+  return out;
+}
+
 // --- page-side code (runs in Meet; no closures — puppeteer serializes these) --
 
 /** Injected before any Meet script: hooks RTCPeerConnection to see every
  * remote audio track and mixes them all into one MediaStreamDestination. */
 function installHooks() {
-  const S = (window.__spike = { events: [], pcs: [], ctx: null, dest: null, rec: null, pending: new Set() });
+  const S = (window.__spike = { events: [], pcs: [], els: [], ctx: null, dest: null, rec: null, recPeak: 0, pending: new Set() });
   const Orig = window.RTCPeerConnection;
   if (!Orig) return;
   const mix = (track) => {
+    // Chromium only decodes (pulls) a remote WebRTC audio track while a media
+    // element plays it; a track fed to WebAudio alone can stay digital silence.
+    // Run 1 heard -91 dB with getStats audioLevel=0, so play every track too.
+    // No mic is granted, so this playout never reaches the call.
+    try {
+      const el = new Audio();
+      el.autoplay = true;
+      el.srcObject = new MediaStream([track]);
+      S.els.push(el);
+      el.play().then(
+        () => S.events.push({ type: 'el-play', id: track.id }),
+        (e) => S.events.push({ type: 'el-play-error', id: track.id, msg: String(e) }),
+      );
+    } catch (e) {
+      S.events.push({ type: 'el-error', msg: String(e) });
+    }
     try {
       if (!S.ctx) {
         S.ctx = new AudioContext();
@@ -137,8 +209,11 @@ function readState() {
     ['invalid', () => has(/check your meeting code|invalid video call name/i)],
     ['removed', () => has(/you've been removed from the meeting|removed you from the meeting/i)],
     ['ended', () => has(/you left the meeting|the call has ended|call ended|meeting has ended|return to home screen/i)],
+    // The lobby shows a Leave call button too (run 1): the lobby's own phrases win over it.
+    ['lobby', () => has(/please wait until a meeting host brings you into the call|asking to be let in|you'll join the call when someone lets you in/i)],
     ['admitted', () => (leave ? 'Leave call button' : null)],
-    ['lobby', () => has(/asking to be let in|please wait until a meeting host|someone will let you in|waiting for the host|asking to join|you'll join the call when someone lets you in/i)],
+    // Weaker phrases ("X is asking to join" is also an in-call notice) only count without the button.
+    ['lobby', () => has(/please wait until a meeting host|someone will let you in|waiting for the host|asking to join/i)],
     // Meet's pre-check page: "Getting ready... System info will be sent to confirm you're not a bot."
     ['loading', () => has(/getting ready\.\.\./i)],
     ['prejoin', () => has(/ask to join|join now|what's your name|ready to join|other ways to join/i)],
@@ -195,9 +270,83 @@ function readNames() {
       (e) => e.getAttribute('aria-label') || firstLine(e),
     ),
   );
-  const captionsEl = document.querySelector('[role="region"][aria-label*="aption" i]');
-  const captions = captionsEl ? captionsEl.innerText.replace(/\s+/g, ' ').slice(-400) : null;
-  return { tiles, selfName, panel, captions };
+  return { tiles, selfName, panel };
+}
+
+/** Turn Meet captions on by the button; returns what it saw/did. The 'c'
+ * shortcut is the node-side fallback. Selectors as used by open-source Meet
+ * bots and caption extensions (aria-label, then the Material icon name). */
+function captionsOn(mayClick) {
+  const on = document.querySelector('button[aria-label*="Turn off captions" i], button[aria-label*="aption" i][aria-pressed="true"]');
+  if (on) return { on: true, did: null };
+  const b =
+    document.querySelector('button[aria-label*="Turn on captions" i]') ||
+    [...document.querySelectorAll('button')].find((x) => /closed_caption_off/.test(x.innerText || ''));
+  if (!b) return { on: false, did: null };
+  if (!mayClick) return { on: false, did: null, seen: (b.getAttribute('aria-label') || '').trim() };
+  b.click();
+  return { on: false, did: `clicked "${(b.getAttribute('aria-label') || b.innerText || '').trim()}"` };
+}
+
+/** Read the caption blocks (one per speaker turn) from the captions region.
+ * Meet's classes are obfuscated and rotate, so: known classes first, then a
+ * structural guess (an element whose first child is a short one-line name and
+ * whose other children hold the text). Every block gets a stable id so node
+ * can tell a rewrite of the same block from a new one. */
+function readCaptions() {
+  const region =
+    document.querySelector('[role="region"][aria-label*="aption" i]') ||
+    document.querySelector('div[role="region"][tabindex="0"]');
+  if (!region) return { region: false, strategy: null, blocks: [] };
+  const txt = (el) => ((el && el.innerText) || '').replace(/\s+/g, ' ').trim();
+  window.__spikeCapId = window.__spikeCapId || 0;
+  const id = (el) => el.dataset.spikeCap || (el.dataset.spikeCap = String(++window.__spikeCapId));
+  let strategy = 'classes';
+  let blocks = [...region.querySelectorAll('.nMcdL')].map((b) => ({
+    id: id(b),
+    name: txt(b.querySelector('.NWpY1d, .KcIKyf, .zs7s8d')),
+    text: txt(b.querySelector('.ygicle, .bh44bd, .iTTPOb')),
+  }));
+  // Known blocks with a name count even while cleared (empty text): foldCaptions needs them.
+  if (!blocks.some((b) => b.name)) {
+    strategy = 'structural';
+    const cand = [...region.querySelectorAll('*')].filter((e) => {
+      if (e.children.length < 2) return false;
+      const name = (e.children[0].innerText || '').trim();
+      return name && name.length <= 80 && !name.includes('\n') && txt(e).length > name.length;
+    });
+    // A wrapper with two or more candidate children is the caption list, not a
+    // turn; of the rest the outermost wins (a text div of several spans can
+    // pass the test inside its turn).
+    const turns = cand.filter((e) => [...e.children].filter((c) => cand.includes(c)).length < 2);
+    blocks = turns
+      .filter((e) => !turns.some((o) => o !== e && o.contains(e)))
+      .map((e) => ({
+        id: id(e),
+        name: txt(e.children[0]),
+        text: [...e.children].slice(1).map(txt).filter(Boolean).join(' '),
+      }));
+  }
+  // Text-less blocks stay: a cleared block on screen differs from one that left (foldCaptions).
+  // Region with text but nothing parsed: a markup sample to fix the selectors.
+  const sample = strategy === 'structural' && !blocks.some((b) => b.text) && txt(region) ? region.innerHTML.slice(0, 600) : null;
+  return { region: true, strategy, blocks, sample };
+}
+
+/** Click the first element matching a CSS selector, else the first
+ * button/menuitem/tab/option whose text or aria-label matches `re` (a regex
+ * source). Returns what it clicked, or null. Used to walk Meet's settings. */
+function clickFirst(css, re) {
+  let el = css ? document.querySelector(css) : null;
+  if (!el && re) {
+    const rx = new RegExp(re, 'i');
+    el = [...document.querySelectorAll('button, [role="menuitem"], [role="tab"], [role="option"], li')].find((e) =>
+      rx.test((e.getAttribute('aria-label') || e.innerText || '').trim()),
+    );
+  }
+  if (!el) return null;
+  el.click();
+  return (el.getAttribute('aria-label') || el.innerText || el.tagName).trim().slice(0, 60);
 }
 
 /** Start the page-side MediaRecorder on the mixed destination. */
@@ -221,6 +370,16 @@ function startRecorder() {
     p.finally(() => S.pending.delete(p));
   };
   S.rec.start(1000);
+  // The level of exactly what MediaRecorder gets: peak RMS between two polls.
+  const an = S.ctx.createAnalyser();
+  S.ctx.createMediaStreamSource(S.dest.stream).connect(an);
+  const buf = new Float32Array(an.fftSize);
+  setInterval(() => {
+    an.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    S.recPeak = Math.max(S.recPeak, Math.sqrt(sum / buf.length));
+  }, 200);
   return S.ctx.state;
 }
 
@@ -245,12 +404,16 @@ async function pollMedia() {
     try {
       const stats = await S.pcs[i].getStats();
       stats.forEach((r) => {
+        // Short keys: the media line is cut at 600 chars in the Zulip report.
+        // samples (totalSamplesReceived) stuck at 0 = nothing decodes/pulls the
+        // track; samples growing with energy 0 = Meet really sends silence.
         if (r.type === 'inbound-rtp' && r.kind === 'audio')
           inbound.push({
             pc: i,
             ssrc: r.ssrc,
-            track: r.trackIdentifier,
-            level: r.audioLevel === undefined ? null : Number(r.audioLevel.toFixed(3)),
+            lvl: r.audioLevel === undefined ? null : Number(r.audioLevel.toFixed(3)),
+            nrg: r.totalAudioEnergy === undefined ? null : Number(r.totalAudioEnergy.toFixed(4)),
+            smp: r.totalSamplesReceived === undefined ? null : r.totalSamplesReceived,
             kB: Math.round((r.bytesReceived || 0) / 1024),
           });
       });
@@ -260,7 +423,11 @@ async function pollMedia() {
     (n, pc) => n + pc.getReceivers().filter((r) => r.track && r.track.kind === 'audio' && r.track.readyState === 'live').length,
     0,
   );
-  return { events, inbound, liveAudio, ctx: S.ctx && S.ctx.state };
+  // Meet's own <audio> elements vs ours: is anything actually playing?
+  const els = (a) => ({ n: a.length, playing: a.filter((e) => !e.paused).length, muted: a.filter((e) => e.muted).length });
+  const recRms = Number(S.recPeak.toFixed(4));
+  S.recPeak = 0;
+  return { events, inbound, liveAudio, ctx: S.ctx && S.ctx.state, meetEls: els([...document.querySelectorAll('audio')]), ourEls: els(S.els), recRms };
 }
 
 // --- node side ---------------------------------------------------------------
@@ -293,6 +460,54 @@ async function login(o) {
   log('sign the bot account in, open https://meet.google.com once to check it, then CLOSE the browser window');
   await new Promise((r) => browser.once('disconnected', r));
   log(`profile saved in ${path.resolve(o.userDataDir)}`);
+}
+
+/** Captions on: the toolbar button, then the 'c' shortcut. Never clicks once
+ * captions read as on, so it cannot toggle them back off. */
+async function enableCaptions(page) {
+  let pressed = false;
+  let clicks = 0;
+  for (let i = 0; i < 10; i++) {
+    // Two clicks at most: a button whose label never flips must not be toggled forever.
+    const r = await page.evaluate(captionsOn, clicks < 2).catch((e) => ({ on: false, did: null, error: e.message }));
+    if (r.on) {
+      log('captions on', { attempt: i, via: pressed ? 'c shortcut' : 'button' });
+      return true;
+    }
+    if (r.did) clicks++;
+    if (r.did || r.error) log('captions', r);
+    if (!clicks && !pressed && i >= 3) {
+      await page.keyboard.press('c'); // Meet shortcut: toggle captions
+      pressed = true;
+      log('captions: no button found, pressed "c"');
+    }
+    await sleep(1500);
+  }
+  log('captions: not confirmed on (no "Turn off captions" button); still reading the captions region');
+  return false;
+}
+
+/** Best effort: More options -> Settings -> Captions -> the language option
+ * (clicked even while its dropdown is closed, as attendee does). */
+async function pickCaptionLang(page, lang) {
+  const steps = [
+    ['more options', 'button[aria-label*="More options" i]', null],
+    ['settings', null, '(^|\\s)settings$'],
+    ['captions tab', '[role="tab"][aria-label="Captions" i], button[aria-label="Captions" i]', '(^|\\s)captions$'],
+    ['language option', `li[data-value="${lang}"], [role="option"][data-value="${lang}"]`, null],
+  ];
+  let ok = true;
+  for (const [what, css, re] of steps) {
+    const r = await page.evaluate(clickFirst, css, re).catch((e) => `error: ${e.message}`);
+    log(`captions lang: ${what}`, r);
+    if (!r || r.startsWith('error')) {
+      ok = false;
+      break;
+    }
+    await sleep(1500);
+  }
+  await page.keyboard.press('Escape'); // close the settings dialog / menu
+  return ok;
 }
 
 async function main() {
@@ -408,15 +623,35 @@ async function main() {
     // --- record phase ---
     summary.result = 'admitted';
     summary.admittedAfterS = Math.round((admittedAt - t0) / 1000);
-    if (o.captions) {
-      await page.keyboard.press('c'); // Meet shortcut: toggle captions
-      log('pressed "c" for captions');
-    }
     log('recorder start, AudioContext', await page.evaluate(startRecorder));
+    const cap = { st: { open: new Map(), done: new Set() }, on: false, region: false, strategy: null, blocks: 0, saved: 0, sampled: false };
+    const capPath = path.join(o.outDir, 'captions.jsonl');
+    const pollCaptions = async (flush) => {
+      const r = await page.evaluate(readCaptions).catch((e) => ({ region: false, strategy: null, blocks: [], error: e.message }));
+      // A failed read is not "every block left": keep the open lines for the next poll.
+      if (r.error && !flush) return;
+      Object.assign(cap, { region: r.region, strategy: r.strategy, blocks: r.blocks.length });
+      if (r.sample && !cap.sampled) {
+        cap.sampled = true;
+        log('captions: region has text but no block parsed; markup sample', r.sample);
+      }
+      for (const u of foldCaptions(cap.st, r.blocks, Date.now(), flush)) {
+        fs.appendFileSync(capPath, JSON.stringify(u) + '\n');
+        cap.saved++;
+      }
+    };
+    const capStats = () => ({ on: cap.on, region: cap.region, strategy: cap.strategy, blocks: cap.blocks, saved: cap.saved });
+    if (o.captions) {
+      fs.writeFileSync(capPath, '');
+      cap.on = await enableCaptions(page);
+      if (o.lang) summary.captionLang = (await pickCaptionLang(page, o.lang)) ? o.lang : 'not set';
+    }
     const recEnd = Date.now() + o.seconds * 1000;
     let tick = 0;
     while (!stop && Date.now() < recEnd) {
-      await sleep(5000);
+      await sleep(1000); // captions every second: Meet drops old blocks from the DOM
+      if (o.captions) await pollCaptions(false);
+      if (++tick % 5) continue;
       const s = await page.evaluate(readState).catch(() => ({ state: 'probe-error', why: '', text: '' }));
       if (s.state !== 'admitted') {
         log(`STATE admitted -> ${s.state}`, { why: s.why, text: s.text });
@@ -427,9 +662,23 @@ async function main() {
         }
       }
       const m = await media();
-      log('media', { liveAudioTracks: m.liveAudio, ctx: m.ctx, inbound: m.inbound, recordedKB: Math.round(audioBytes / 1024) });
-      log('names', await page.evaluate(readNames).catch((e) => e.message));
-      if (++tick % 6 === 1) await shot('in-call');
+      log('media', {
+        liveAudioTracks: m.liveAudio,
+        ctx: m.ctx,
+        inbound: m.inbound,
+        meetEls: m.meetEls,
+        ourEls: m.ourEls,
+        recRms: m.recRms,
+        recordedKB: Math.round(audioBytes / 1024),
+        captions: cap.saved,
+      });
+      const names = await page.evaluate(readNames).catch((e) => ({ error: e.message }));
+      log('names', { ...names, captions: capStats() });
+      if (tick % 30 === 5) await shot('in-call');
+    }
+    if (o.captions) {
+      await pollCaptions(true);
+      summary.captions = capStats();
     }
     await page.evaluate(stopRecorder).catch(() => {});
     summary.recordedS = Math.round((Date.now() - admittedAt) / 1000);
@@ -445,10 +694,13 @@ async function main() {
   }
 }
 
-main().then(
-  (code) => process.exit(code),
-  (e) => {
-    process.stderr.write(`fatal: ${e.stack}\n`);
-    process.exit(4);
-  },
-);
+if (require.main === module)
+  main().then(
+    (code) => process.exit(code),
+    (e) => {
+      process.stderr.write(`fatal: ${e.stack}\n`);
+      process.exit(4);
+    },
+  );
+
+module.exports = { parseArgs, foldCaptions, readState, readCaptions, installHooks, startRecorder, pollMedia, CAPTION_SETTLE_MS };
