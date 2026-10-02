@@ -54,7 +54,7 @@ type Message struct {
 
 // streamName is Zulip's display_recipient: the stream name for stream messages,
 // but an array of users for DMs. A DM decodes to "" instead of failing the whole
-// event batch — the bot ignores non-stream messages anyway.
+// event batch — a DM job is routed by its sender, not by a stream name.
 type streamName string
 
 func (s *streamName) UnmarshalJSON(b []byte) error {
@@ -145,6 +145,19 @@ func (z *Zulip) SendMessage(ctx context.Context, stream, topic, content string) 
 		"type":    {"stream"},
 		"to":      {string(to)},
 		"topic":   {topic},
+		"content": {content},
+	}, nil)
+}
+
+// Reply posts content where the job came from: back to the sender for a
+// DM-started job, otherwise into the job's stream and topic.
+func (z *Zulip) Reply(ctx context.Context, job Job, content string) error {
+	if job.DMUserID == 0 {
+		return z.SendMessage(ctx, job.Stream, job.Topic, content)
+	}
+	return z.do(ctx, http.MethodPost, "/api/v1/messages", nil, url.Values{
+		"type":    {"private"},
+		"to":      {"[" + strconv.FormatInt(job.DMUserID, 10) + "]"},
 		"content": {content},
 	}, nil)
 }

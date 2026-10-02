@@ -16,7 +16,8 @@ const retryDelay = 5 * time.Second
 
 // Bot is the Zulip event loop implementing the emoji-reaction flow: a stream
 // message carrying a Jitsi URL gets a microphone reaction, and somebody clicking
-// that reaction starts a recording.
+// that reaction starts a recording. A Jitsi URL sent to the bot by DM is an
+// explicit request and starts a recording right away.
 type Bot struct {
 	z       *Zulip
 	botID   int64
@@ -99,7 +100,14 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 	switch {
 	case ev.Type == "message" && ev.Message != nil:
 		m := ev.Message
-		if m.Type != "stream" || m.SenderID == b.botID || !b.jitsiRe.MatchString(m.Content) {
+		if m.SenderID == b.botID || !b.jitsiRe.MatchString(m.Content) {
+			return
+		}
+		if m.Type == "private" {
+			b.startJob(*m, m.SenderID)
+			return
+		}
+		if m.Type != "stream" {
 			return
 		}
 		// Offer the recording silently — a reaction, never a text message.
@@ -110,13 +118,13 @@ func (b *Bot) handle(ctx context.Context, ev Event) {
 		slog.Info("call link detected", "message_id", m.ID,
 			"stream", string(m.DisplayRecipient), "topic", m.Subject)
 	case ev.Type == "reaction" && ev.Op == "add" && ev.EmojiName == micEmoji && ev.UserID != b.botID:
-		b.startJob(ctx, ev.MessageID, ev.UserID)
+		b.startReacted(ctx, ev.MessageID, ev.UserID)
 	}
 }
 
-// startJob turns a microphone-reaction click into a recording job. The reaction
-// event carries no content, so the message has to be fetched.
-func (b *Bot) startJob(ctx context.Context, msgID, userID int64) {
+// startReacted turns a microphone-reaction click into a recording job. The
+// reaction event carries no content, so the message has to be fetched.
+func (b *Bot) startReacted(ctx context.Context, msgID, userID int64) {
 	m, err := b.z.GetMessage(ctx, msgID)
 	if err != nil {
 		slog.Error("fetching the reacted message failed", "message_id", msgID, "err", err)
@@ -125,6 +133,12 @@ func (b *Bot) startJob(ctx context.Context, msgID, userID int64) {
 	if m.Type != "stream" {
 		return
 	}
+	b.startJob(m, userID)
+}
+
+// startJob starts a recording for the Jitsi room in m. A DM job carries its
+// sender instead of a stream/topic, so every reply goes back to that DM.
+func (b *Bot) startJob(m Message, userID int64) {
 	// ponytail: sentence punctuation right after a pasted link is trimmed, so a
 	// room literally named "standup." is unreachable from prose. Drop the trim if
 	// anyone ever names one that.
@@ -133,11 +147,14 @@ func (b *Bot) startJob(ctx context.Context, msgID, userID int64) {
 		return
 	}
 	job := Job{
-		ID:        strconv.FormatInt(msgID, 10),
-		MessageID: msgID,
+		ID:        strconv.FormatInt(m.ID, 10),
+		MessageID: m.ID,
 		Stream:    string(m.DisplayRecipient),
 		Topic:     m.Subject,
 		JitsiURL:  roomURL,
+	}
+	if m.Type == "private" {
+		job.Stream, job.Topic, job.DMUserID = "", "", m.SenderID
 	}
 	slog.Info("recording requested", "job", job.ID, "user_id", userID)
 	// The recording indicator is the runner's (see syncIndicator). A second

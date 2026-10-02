@@ -69,6 +69,7 @@ type finishedPayload struct {
 	MessageID    int64    `json:"message_id"`
 	Stream       string   `json:"stream"`
 	Topic        string   `json:"topic"`
+	DMUserID     int64    `json:"dm_user_id,omitempty"` // DM-started job: stream and topic are empty
 	JitsiURL     string   `json:"jitsi_url"`
 	AudioPath    string   `json:"audio_path"`
 	DurationS    float64  `json:"duration_s"`
@@ -101,6 +102,7 @@ func buildPayload(cfg Config, job Job) finishedPayload {
 		MessageID:    job.MessageID,
 		Stream:       job.Stream,
 		Topic:        job.Topic,
+		DMUserID:     job.DMUserID,
 		JitsiURL:     job.JitsiURL,
 		AudioPath:    hostPath(cfg, job.AudioPath),
 		DurationS:    job.DurationS,

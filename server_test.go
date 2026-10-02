@@ -25,11 +25,11 @@ func newTestServer(secret string, sendErr error) (http.Handler, chan sentMessage
 			}
 			return Job{ID: "42", Stream: "stream-x", Topic: "topic-y"}, nil
 		},
-		send: func(_ context.Context, stream, topic, content string) error {
+		send: func(_ context.Context, job Job, content string) error {
 			if sendErr != nil {
 				return sendErr
 			}
-			sent <- sentMessage{stream, topic, content}
+			sent <- sentMessage{job.Stream, job.Topic, content}
 			return nil
 		},
 	}

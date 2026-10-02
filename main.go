@@ -95,7 +95,7 @@ func run(ctx context.Context, cfg Config, ready func(net.Addr)) error {
 	srv := newHTTPServer(cfg.ListenAddr, (&server{
 		secret:  cfg.WebhookSecret,
 		loadJob: func(id string) (Job, error) { return loadJob(cfg.DataDir, id) },
-		send:    z.SendMessage,
+		send:    z.Reply,
 	}).handler())
 	// Listen before serving so a busy port is a startup failure, not a log line.
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

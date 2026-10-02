@@ -117,8 +117,13 @@ func TestBotHandle(t *testing.T) {
 			event: Event{Type: "message", Message: other(msg, func(m *Message) { m.Content = "lunch?" })},
 		},
 		{
-			name:  "a private message is ignored",
-			event: Event{Type: "message", Message: other(msg, func(m *Message) { m.Type = "private" })},
+			name:     "a private message with a call link starts the job without a reaction",
+			event:    Event{Type: "message", Message: other(msg, func(m *Message) { m.Type = "private" })},
+			wantJobs: 1,
+		},
+		{
+			name:  "a private message without a call link is ignored",
+			event: Event{Type: "message", Message: other(msg, func(m *Message) { m.Type = "private"; m.Content = "hi" })},
 		},
 		{
 			// The runner, not the bot, puts the recording indicator on.
@@ -168,6 +173,18 @@ func TestBotStartsTheExpectedJob(t *testing.T) {
 	want := Job{ID: "100", MessageID: 100, Stream: testStream, Topic: testTopic, JitsiURL: testRoomURL}
 	if !reflect.DeepEqual(jobs[0], want) {
 		t.Errorf("job = %+v; want %+v", jobs[0], want)
+	}
+}
+
+// A DM job is routed by its sender: no stream or topic, replies go to the DM.
+func TestBotStartsADMJob(t *testing.T) {
+	f := newBotFixture(t, "https://meet.jit.si", streamMessage(), nil)
+	dm := Message{ID: 200, Type: "private", Content: "please record " + testRoomURL, SenderID: 42}
+	f.bot.handle(context.Background(), Event{Type: "message", Message: &dm})
+
+	want := []Job{{ID: "200", MessageID: 200, DMUserID: 42, JitsiURL: testRoomURL}}
+	if got := f.startedJobs(); !reflect.DeepEqual(got, want) {
+		t.Errorf("jobs = %+v; want %+v", got, want)
 	}
 }
 

@@ -24,7 +24,7 @@ import (
 type zulipAPI interface {
 	AddReaction(ctx context.Context, msgID int64, emoji string) error
 	RemoveReaction(ctx context.Context, msgID int64, emoji string) error
-	SendMessage(ctx context.Context, stream, topic, content string) error
+	Reply(ctx context.Context, job Job, content string) error
 }
 
 // Runner owns the recorder child processes and the job state on disk.
@@ -293,7 +293,7 @@ func (r *Runner) note(job Job) {
 	}
 	ctx, cancel := context.WithTimeout(r.ctx, zulipTimeout)
 	defer cancel()
-	if err := r.z.SendMessage(ctx, job.Stream, job.Topic, text); err != nil {
+	if err := r.z.Reply(ctx, job, text); err != nil {
 		slog.Error("posting failure note", "job", job.ID, "err", err)
 	}
 }
