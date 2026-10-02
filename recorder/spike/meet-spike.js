@@ -129,7 +129,7 @@ function foldCaptions(st, blocks, now, flush = false) {
 /** Injected before any Meet script: hooks RTCPeerConnection to see every
  * remote audio track and mixes them all into one MediaStreamDestination. */
 function installHooks() {
-  const S = (window.__spike = { events: [], pcs: [], els: [], pageEls: [], taps: new Map(), tapPeak: 0, ctx: null, dest: null, recs: [], peaks: { mix: 0, tab: 0 }, sec: { mix: 0, tab: 0, meetCtx: 0 }, speech: null, pending: new Set() });
+  const S = (window.__spike = { events: [], pcs: [], els: [], pageEls: [], taps: new Map(), tapPeak: 0, ctx: null, dest: null, recs: [], peaks: { mix: 0, tab: 0 }, sec: { mix: [0, 0], tab: [0, 0], meetCtx: [0, 0] }, speech: null, pending: new Set() });
   // Hard rule: the bot never sends audio or video into the call. The fake
   // devices are a silent WAV and a black frame, Meet's mic/camera toggles are
   // turned off before joining, and on top of that every captured track is
@@ -181,7 +181,8 @@ function installHooks() {
     setInterval(() => {
       const v = rms(an, buf);
       S.peaks[key] = Math.max(S.peaks[key], v);
-      S.sec[key] = Math.max(S.sec[key], v);
+      S.sec[key][0] += v * v;
+      S.sec[key][1]++;
     }, 200);
   };
   // Method "meetCtx": run 2 saw no <audio> elements, so Meet may play remote
@@ -207,11 +208,11 @@ function installHooks() {
     return r;
   };
   setInterval(() => {
-    for (const an of S.taps.values()) {
-      const v = rms(an, an.buf);
-      S.tapPeak = Math.max(S.tapPeak, v);
-      S.sec.meetCtx = Math.max(S.sec.meetCtx, v);
-    }
+    let v = 0;
+    for (const an of S.taps.values()) v = Math.max(v, rms(an, an.buf));
+    S.tapPeak = Math.max(S.tapPeak, v);
+    S.sec.meetCtx[0] += v * v;
+    S.sec.meetCtx[1]++;
   }, 200);
   // Media elements the page plays a MediaStream with, attached to the DOM or not.
   const play = HTMLMediaElement.prototype.play;
@@ -520,14 +521,16 @@ function startRecorder() {
   }
   if (S.ctx.state === 'suspended') S.ctx.resume();
   S.record(S.dest.stream, '__spikeChunk', 'mix');
-  // Speech-like metric: per method [seconds above -45 dBFS, seconds]. Join
+  // Speech-like metric: per method [seconds whose RMS (mean energy of the 200 ms
+  // samples, as wavLevel does per second) is above -45 dBFS, seconds]. Join
   // chimes light up a second or two; speech lights up many.
   S.speech = { mix: [0, 0], tab: [0, 0], meetCtx: [0, 0] };
   setInterval(() => {
     for (const k of Object.keys(S.speech)) {
+      const [sum, n] = S.sec[k];
       S.speech[k][1]++;
-      if (S.sec[k] > 0.005623) S.speech[k][0]++; // -45 dBFS, = SPEECH_RMS
-      S.sec[k] = 0;
+      if (n && Math.sqrt(sum / n) > 0.005623) S.speech[k][0]++; // -45 dBFS, = SPEECH_RMS
+      S.sec[k] = [0, 0];
     }
   }, 1000);
   return S.ctx.state;
