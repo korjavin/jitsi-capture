@@ -78,11 +78,11 @@ boundaries and a fake recorder shell script for the subprocess.
 
 ## Architecture Overview
 
-> **Split in progress (epic jitsi2outline-7j3):** this repo is becoming
-> `zulip-bot`, an orchestrator that asks the separate `jitsi-recorder` /
-> `meet-recorder` services to record over HTTP. `docs/architecture.md` is the
-> spec and the canonical copy of the recorder contract. The text below
-> describes the current code until the split lands.
+> **Being replaced (bead jitsi2outline-1qq):** this service is superseded by
+> `korjavin/zulip-recording-bot`, `korjavin/jitsi-recorder` and
+> `korjavin/meet-recorder` (spec: `docs/architecture.md` in
+> zulip-recording-bot). Only fixes needed to keep production running land
+> here until the cutover.
 
 `jitsi-capture` is the first of three services:
 
